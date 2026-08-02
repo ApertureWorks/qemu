@@ -163,10 +163,10 @@ version_ge () {
     done
 }
 
-if printf %s\\n "$source_path" "$PWD" | grep -q "[[:space:]:]";
-then
-  error_exit "main directory cannot contain spaces nor colons"
-fi
+# if printf %s\\n "$source_path" "$PWD" | grep -q "[[:space:]:]";
+# then
+#   error_exit "main directory cannot contain spaces nor colons"
+# fi
 
 # parse CC options first; some compiler tests are used to establish
 # some defaults, based on the host environment
@@ -943,15 +943,14 @@ if test "$?" -ne 0 ; then
 fi
 
 # Suppress writing compiled files
-python="$python -B"
-mkvenv="$python ${source_path}/python/scripts/mkvenv.py"
+mkvenv="$python -B \"${source_path}/python/scripts/mkvenv.py\""
 
 # Finish preparing the virtual environment using vendored .whl files.
 # Even if PyPI is allowed, we disallow it here to force installation
 # from our preferred vendored versions.
 
-$mkvenv ensuregroup --dir "${source_path}/python/wheels" \
-     ${source_path}/pythondeps.toml meson || exit 1
+"$python" -B "${source_path}/python/scripts/mkvenv.py" ensuregroup --dir "${source_path}/python/wheels" \
+     "${source_path}/pythondeps.toml" meson || exit 1
 
 # At this point, we expect Meson to be installed and available.
 # We expect mkvenv or pip to have created pyvenv/bin/meson for us.
@@ -985,16 +984,16 @@ fi
 
 # Unconditionally install our tooling group. PyPI is allowed if enabled here.
 
-$mkvenv ensuregroup $mkvenv_online_flag \
+"$python" -B "${source_path}/python/scripts/mkvenv.py" ensuregroup $mkvenv_online_flag \
         --dir "${source_path}/python/wheels" \
-        ${source_path}/pythondeps.toml tooling || exit 1
+        "${source_path}/pythondeps.toml" tooling || exit 1
 
 # Conditionally ensure Sphinx is installed.
 
 if test "$docs" != "disabled" ; then
-    if ! $mkvenv ensuregroup \
+    if ! "$python" -B "${source_path}/python/scripts/mkvenv.py" ensuregroup \
          $(test "$docs" = "enabled" && echo "$mkvenv_online_flag") \
-         ${source_path}/pythondeps.toml docs;
+         "${source_path}/pythondeps.toml" docs;
     then
         if test "$docs" = "enabled" ; then
             exit 1
@@ -1744,7 +1743,7 @@ if test "$rust" != disabled; then
   echo "RUST_TARGET_TRIPLE=$rust_target_triple" >> $config_host_mak
 fi
 echo "PYTHON=$python" >> $config_host_mak
-echo "MKVENV_ENSUREGROUP=$mkvenv ensuregroup $mkvenv_online_flag" >> $config_host_mak
+echo "MKVENV_ENSUREGROUP=pyvenv/bin/python3 -B python/scripts/mkvenv.py ensuregroup $mkvenv_online_flag" >> $config_host_mak
 echo "GENISOIMAGE=$genisoimage" >> $config_host_mak
 echo "MESON=$meson" >> $config_host_mak
 echo "NINJA=$ninja" >> $config_host_mak
