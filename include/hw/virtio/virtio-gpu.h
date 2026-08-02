@@ -61,6 +61,9 @@ struct virtio_gpu_simple_resource {
     int dmabuf_fd;
     uint8_t *remapped;
 
+    void *hostmem_priv;
+
+
     QTAILQ_ENTRY(virtio_gpu_simple_resource) next;
 };
 

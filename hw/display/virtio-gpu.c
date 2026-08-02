@@ -26,6 +26,7 @@
 #include "hw/virtio/virtio-gpu-bswap.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
 #include "hw/virtio/virtio-bus.h"
+#include "hw/virtio/virtio-gpu-hostmem.h"
 #include "hw/core/qdev-properties.h"
 #include "qemu/log.h"
 #include "qemu/memfd.h"
@@ -345,9 +346,10 @@ static void virtio_gpu_resource_create_blob(VirtIOGPU *g,
     }
 
     if (cblob.blob_mem != VIRTIO_GPU_BLOB_MEM_GUEST &&
-        cblob.blob_flags != VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: invalid memory type\n",
-                      __func__);
+        cblob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D &&
+        cblob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: invalid memory type %d\n",
+                      __func__, cblob.blob_mem);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
         return;
     }
@@ -372,7 +374,7 @@ static void virtio_gpu_resource_create_blob(VirtIOGPU *g,
         return;
     }
 
-    virtio_gpu_init_udmabuf(res);
+    virtio_gpu_hostmem_create_resource(g, res);
     QTAILQ_INSERT_HEAD(&g->reslist, res, next);
 }
 
@@ -957,7 +959,7 @@ void virtio_gpu_cleanup_mapping(VirtIOGPU *g,
     res->addrs = NULL;
 
     if (res->blob) {
-        virtio_gpu_fini_udmabuf(g, res);
+        virtio_gpu_hostmem_destroy_resource(g, res);
     }
 }
 
@@ -994,7 +996,7 @@ virtio_gpu_resource_attach_backing(VirtIOGPU *g,
     }
 
     if (!res->image) {
-        virtio_gpu_init_udmabuf(res);
+        virtio_gpu_hostmem_create_resource(g, res);
     }
 }
 
@@ -1498,7 +1500,7 @@ static int virtio_gpu_blob_load(QEMUFile *f, void *opaque, size_t size,
             return -EINVAL;
         }
 
-        virtio_gpu_init_udmabuf(res);
+        virtio_gpu_hostmem_create_resource(g, res);
 
         resource_id = qemu_get_be32(f);
     }
@@ -1564,8 +1566,8 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
     if (virtio_gpu_blob_enabled(g->parent_obj.conf)) {
         if (!virtio_gpu_rutabaga_enabled(g->parent_obj.conf) &&
             !virtio_gpu_virgl_enabled(g->parent_obj.conf) &&
-            !virtio_gpu_have_udmabuf()) {
-            error_setg(errp, "need rutabaga or udmabuf for blob resources");
+            !virtio_gpu_hostmem_available()) {
+            error_setg(errp, "need rutabaga or host memory backend for blob resources");
             return;
         }
 
