@@ -162,8 +162,8 @@ static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_
     hm->iosurface_id = IOSurfaceGetID(surface);
     res->hostmem_priv = hm;
 
-    qemu_log_mask(LOG_UNIMP, "[QEMU VirtIO GPU Trace] RESOURCE_CREATE_BLOB: res_id=%u, blob_id=%" PRIu64 ", size=%" PRIu64 ", iosurface_id=%u\n",
-                  res->resource_id, res->blob_id, res->blob_size, hm->iosurface_id);
+    qemu_log_mask(LOG_UNIMP, "[QEMU VirtIO GPU Trace] RESOURCE_CREATE_BLOB: res_id=%u, size=%" PRIu64 ", iosurface_id=%u\n",
+                  res->resource_id, res->blob_size, hm->iosurface_id);
 
     /* Lock CPU mapping for host RAM access */
     int ret = macos_hostmem_map_resource(g, res);

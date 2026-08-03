@@ -817,15 +817,13 @@ else
     fi
 fi
 if [ "$system" = "yes" ]; then
-    mak_wilds="${mak_wilds} $source_path/configs/targets/*-softmmu.mak"
+    for config in "$source_path"/configs/targets/*-softmmu.mak; do
+        target="$(basename "$config" .mak)"
+        if echo "$target_list_exclude" | grep -vq "$target"; then
+            default_target_list="${default_target_list} $target"
+        fi
+    done
 fi
-
-for config in $mak_wilds; do
-    target="$(basename "$config" .mak)"
-    if echo "$target_list_exclude" | grep -vq "$target"; then
-        default_target_list="${default_target_list} $target"
-    fi
-done
 
 if test x"$show_help" = x"yes" ; then
 cat << EOF
@@ -1164,7 +1162,7 @@ fi
 ##########################################
 # detect rust triple
 
-meson_version=$($meson --version)
+meson_version=$("$meson" --version)
 if test "$rust" != disabled && ! version_ge "$meson_version" 1.10.0; then
   if test "$rust" = enabled; then
     $mkvenv ensuregroup --dir "${source_path}/python/wheels" \
@@ -1291,7 +1289,7 @@ fi
 # functions to probe cross compilers
 
 if test "$container_command" = ""; then
-    container_command=$($python "$source_path"/tests/docker/docker.py probe)
+    container_command=$("$python" "$source_path"/tests/docker/docker.py probe)
     test "$container_command" = "no" && container_command=""
 fi
 if test $use_containers = "yes" && test "$container_command" != ""; then
@@ -1945,7 +1943,7 @@ if test "$skip_meson" = no; then
   test -n "$gdb_bin" && meson_option_add "-Dgdb=$gdb_bin"
 
   run_meson() {
-    NINJA=$ninja $meson setup "$@" "$PWD" "$source_path"
+    NINJA="$ninja" "$meson" setup "$@" "$PWD" "$source_path"
   }
   eval run_meson $meson_options
   if test "$?" -ne 0 ; then
