@@ -919,19 +919,25 @@ void qemu_console_set_cursor(QemuConsole *c, QEMUCursor *cursor)
 QEMUGLContext qemu_console_gl_ctx_create(QemuConsole *con,
                                          QEMUGLParams *qparams)
 {
-    assert(con->gl);
+    if (!con || !con->gl || !con->gl->ops || !con->gl->ops->dpy_gl_ctx_create) {
+        return NULL;
+    }
     return con->gl->ops->dpy_gl_ctx_create(con->gl, qparams);
 }
 
 void qemu_console_gl_ctx_destroy(QemuConsole *con, QEMUGLContext ctx)
 {
-    assert(con->gl);
+    if (!con || !con->gl || !con->gl->ops || !con->gl->ops->dpy_gl_ctx_destroy) {
+        return;
+    }
     con->gl->ops->dpy_gl_ctx_destroy(con->gl, ctx);
 }
 
 int qemu_console_gl_ctx_make_current(QemuConsole *con, QEMUGLContext ctx)
 {
-    assert(con->gl);
+    if (!con || !con->gl || !con->gl->ops || !con->gl->ops->dpy_gl_ctx_make_current) {
+        return 0;
+    }
     return con->gl->ops->dpy_gl_ctx_make_current(con->gl, ctx);
 }
 

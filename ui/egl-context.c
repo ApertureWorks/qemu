@@ -2,6 +2,7 @@
 #include "qemu/error-report.h"
 #include "ui/egl-context.h"
 
+#if !defined(__APPLE__) && !defined(CONFIG_DARWIN)
 QEMUGLContext qemu_egl_create_context(DisplayGLCtx *dgc,
                                       QEMUGLParams *params,
                                       EGLContext share_context)
@@ -41,3 +42,21 @@ int qemu_egl_make_context_current(DisplayGLCtx *dgc,
 
    return 0;
 }
+#else
+QEMUGLContext qemu_egl_create_context(DisplayGLCtx *dgc,
+                                      QEMUGLParams *params,
+                                      EGLContext share_context)
+{
+    return NULL;
+}
+
+void qemu_egl_destroy_context(DisplayGLCtx *dgc, QEMUGLContext ctx)
+{
+}
+
+int qemu_egl_make_context_current(DisplayGLCtx *dgc,
+                                  QEMUGLContext ctx)
+{
+    return -1;
+}
+#endif

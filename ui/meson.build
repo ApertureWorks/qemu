@@ -107,7 +107,7 @@ if opengl.found()
   ui_modules += {'opengl' : opengl_ss}
 endif
 
-if opengl.found()
+if opengl.found() and host_os != 'darwin'
   egl_headless_ss = ss.source_set()
   egl_headless_ss.add(when: [opengl, pixman],
                       if_true: [files('egl-headless.c'), gbm])

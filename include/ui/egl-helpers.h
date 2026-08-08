@@ -2,7 +2,31 @@
 #define EGL_HELPERS_H
 
 #include <epoxy/gl.h>
+#if !defined(__APPLE__) && !defined(CONFIG_DARWIN)
 #include <epoxy/egl.h>
+#else
+typedef void *EGLDisplay;
+typedef void *EGLConfig;
+typedef void *EGLContext;
+typedef void *EGLSurface;
+typedef void *EGLImageKHR;
+typedef void *EGLClientBuffer;
+typedef unsigned int EGLenum;
+typedef unsigned int EGLBoolean;
+typedef int EGLint;
+typedef uintptr_t EGLNativeDisplayType;
+typedef uintptr_t EGLNativeWindowType;
+typedef uintptr_t EGLNativePixmapType;
+#ifndef EGL_NO_DISPLAY
+#define EGL_NO_DISPLAY ((EGLDisplay)0)
+#endif
+#ifndef EGL_NO_CONTEXT
+#define EGL_NO_CONTEXT ((EGLContext)0)
+#endif
+#ifndef EGL_NO_SURFACE
+#define EGL_NO_SURFACE ((EGLSurface)0)
+#endif
+#endif
 #ifdef CONFIG_GBM
 #include <gbm.h>
 #endif
