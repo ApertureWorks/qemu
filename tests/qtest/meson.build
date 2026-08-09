@@ -30,6 +30,7 @@ qtests_generic = [
   'qos-test',
   'readconfig-test',
   'netdev-socket',
+  'virtio-vsock-test',
 ]
 if enable_modules
   qtests_generic += [ 'modules-test' ]

@@ -225,7 +225,6 @@ have_tpm = get_option('tpm') \
 
 # vhost
 have_vhost_user = get_option('vhost_user') \
-  .disable_auto_if(host_os != 'linux') \
   .require(host_os != 'windows',
            error_message: 'vhost-user is not available on Windows').allowed()
 have_vhost_vdpa = get_option('vhost_vdpa') \
@@ -240,7 +239,7 @@ have_vhost_user_crypto = get_option('vhost_crypto') \
 
 have_vhost = have_vhost_user or have_vhost_vdpa or have_vhost_kernel
 
-have_vhost_net_user = have_vhost_user and get_option('vhost_net').allowed()
+have_vhost_net_user = have_vhost_user and host_os == 'linux' and get_option('vhost_net').allowed()
 have_vhost_net_vdpa = have_vhost_vdpa and get_option('vhost_net').allowed()
 have_vhost_net_kernel = have_vhost_kernel and get_option('vhost_net').allowed()
 have_vhost_net = have_vhost_net_kernel or have_vhost_net_user or have_vhost_net_vdpa
