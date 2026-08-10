@@ -14,9 +14,94 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <IOKit/IOReturn.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stdint.h>
 
 /* Maximum allowed single blob allocation size (1TB sanity limit) */
 #define MAX_BLOB_SIZE (1ULL << 40)
+
+/*
+ * gpu_sock_notify_created / gpu_sock_notify_destroyed
+ *
+ * Notify Aperture's GPUControlServer of blob resource lifecycle events.
+ * Wire format (big-endian, Option B — IDs only):
+ *
+ *   GPUResourceCreated  (9 bytes): [0x01][4B resource_id][4B iosurface_id]
+ *   GPUResourceDestroyed (5 bytes): [0x02][4B resource_id]
+ *
+ * Each call opens a new AF_UNIX connection, sends the packet with MSG_DONTWAIT
+ * (so the QEMU main loop is NEVER blocked by a slow host receiver), and closes.
+ * connect() failing is intentionally silent — GPUControlServer may not be
+ * started for H.264 sessions.
+ */
+static const char *aperture_gpu_sock_path(void)
+{
+    return getenv("APERTURE_GPU_SOCK");
+}
+
+static void gpu_sock_send(const uint8_t *buf, size_t len)
+{
+    const char *sock_path = aperture_gpu_sock_path();
+    if (!sock_path || *sock_path == '\0') {
+        return;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        /* GPUControlServer not yet listening or not a zero-copy session. */
+        close(fd);
+        return;
+    }
+
+    /* Best-effort non-blocking send. If the host is slow, we drop this event
+     * rather than stalling the QEMU main loop. The next frame will re-sync. */
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, buf + sent, len - sent, MSG_DONTWAIT);
+        if (n <= 0) {
+            break;
+        }
+        sent += (size_t)n;
+    }
+
+    close(fd);
+}
+
+static void gpu_sock_notify_created(uint32_t resource_id, uint32_t iosurface_id)
+{
+    uint8_t buf[9];
+    buf[0] = 0x01;
+    buf[1] = (resource_id  >> 24) & 0xFF;
+    buf[2] = (resource_id  >> 16) & 0xFF;
+    buf[3] = (resource_id  >>  8) & 0xFF;
+    buf[4] = (resource_id       ) & 0xFF;
+    buf[5] = (iosurface_id >> 24) & 0xFF;
+    buf[6] = (iosurface_id >> 16) & 0xFF;
+    buf[7] = (iosurface_id >>  8) & 0xFF;
+    buf[8] = (iosurface_id      ) & 0xFF;
+    gpu_sock_send(buf, sizeof(buf));
+}
+
+static void gpu_sock_notify_destroyed(uint32_t resource_id)
+{
+    uint8_t buf[5];
+    buf[0] = 0x02;
+    buf[1] = (resource_id >> 24) & 0xFF;
+    buf[2] = (resource_id >> 16) & 0xFF;
+    buf[3] = (resource_id >>  8) & 0xFF;
+    buf[4] = (resource_id      ) & 0xFF;
+    gpu_sock_send(buf, sizeof(buf));
+}
 
 struct VirtIOGPUMacOSHostMem {
     IOSurfaceRef surface;
@@ -165,6 +250,9 @@ static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_
     qemu_log_mask(LOG_UNIMP, "[QEMU VirtIO GPU Trace] RESOURCE_CREATE_BLOB: res_id=%u, size=%" PRIu64 ", iosurface_id=%u\n",
                   res->resource_id, res->blob_size, hm->iosurface_id);
 
+    /* Notify Aperture host that this IOSurface is now associated with resource_id. */
+    gpu_sock_notify_created(res->resource_id, hm->iosurface_id);
+
     /* Lock CPU mapping for host RAM access */
     int ret = macos_hostmem_map_resource(g, res);
     if (ret < 0) {
@@ -184,6 +272,10 @@ static void macos_hostmem_destroy_resource(VirtIOGPU *g, struct virtio_gpu_simpl
     }
 
     struct VirtIOGPUMacOSHostMem *hm = (struct VirtIOGPUMacOSHostMem *)res->hostmem_priv;
+
+    /* Notify Aperture before releasing the surface so host can stop sampling it. */
+    gpu_sock_notify_destroyed(res->resource_id);
+
     res->hostmem_priv = NULL;
 
     if (hm->surface) {
