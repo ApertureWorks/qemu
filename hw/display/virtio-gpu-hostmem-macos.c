@@ -77,7 +77,7 @@ static void gpu_sock_send(const uint8_t *buf, size_t len)
     close(fd);
 }
 
-static void gpu_sock_notify_created(uint32_t resource_id, uint32_t iosurface_id)
+void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_id)
 {
     uint8_t buf[9];
     buf[0] = 0x01;
@@ -92,7 +92,7 @@ static void gpu_sock_notify_created(uint32_t resource_id, uint32_t iosurface_id)
     gpu_sock_send(buf, sizeof(buf));
 }
 
-static void gpu_sock_notify_destroyed(uint32_t resource_id)
+void virtio_gpu_hostmem_notify_destroyed(uint32_t resource_id)
 {
     uint8_t buf[5];
     buf[0] = 0x02;
@@ -232,6 +232,58 @@ static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_
     CFDictionarySetValue(props, kIOSurfaceAllocSize, bytes_num);
     CFRelease(bytes_num);
 
+    CFDictionarySetValue(props, CFSTR("IOSurfaceIsGlobal"), kCFBooleanTrue);
+
+    int bpe = 4;
+    CFNumberRef bpe_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bpe);
+    CFDictionarySetValue(props, kIOSurfaceBytesPerElement, bpe_num);
+    CFRelease(bpe_num);
+
+    uint32_t pixel_format = 0x52474241; // 'RGBA'
+    CFNumberRef fmt_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixel_format);
+    CFDictionarySetValue(props, kIOSurfacePixelFormat, fmt_num);
+    CFRelease(fmt_num);
+
+    uint64_t total_pixels = size / 4;
+    int w = (int)total_pixels;
+    int h = 1;
+
+    /* Detect 2D render buffers by finding the factorization closest to standard display aspect ratios */
+    if (size >= 320 * 240 * 4) {
+        float best_diff = 1000.0f;
+        for (int test_w = 3840; test_w >= 320; test_w -= 16) {
+            if (total_pixels % test_w == 0) {
+                int test_h = (int)(total_pixels / test_w);
+                float ar = (float)test_w / (float)test_h;
+                if (ar >= 0.5f && ar <= 2.4f) {
+                    float diff_16_10 = fabsf(ar - 1.6f);
+                    float diff_16_9  = fabsf(ar - 1.777f);
+                    float diff_4_3   = fabsf(ar - 1.333f);
+                    float diff_port  = fabsf(ar - 0.625f);
+                    float min_d = fminf(fminf(diff_16_10, diff_16_9), fminf(diff_4_3, diff_port));
+                    if (min_d < best_diff) {
+                        best_diff = min_d;
+                        w = test_w;
+                        h = test_h;
+                    }
+                }
+            }
+        }
+    }
+    int bpr = w * 4;
+
+    CFNumberRef w_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &w);
+    CFDictionarySetValue(props, kIOSurfaceWidth, w_num);
+    CFRelease(w_num);
+
+    CFNumberRef h_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &h);
+    CFDictionarySetValue(props, kIOSurfaceHeight, h_num);
+    CFRelease(h_num);
+
+    CFNumberRef bpr_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bpr);
+    CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bpr_num);
+    CFRelease(bpr_num);
+
     IOSurfaceRef surface = IOSurfaceCreate(props);
     CFRelease(props);
 
@@ -251,7 +303,7 @@ static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_
                   res->resource_id, res->blob_size, hm->iosurface_id);
 
     /* Notify Aperture host that this IOSurface is now associated with resource_id. */
-    gpu_sock_notify_created(res->resource_id, hm->iosurface_id);
+    virtio_gpu_hostmem_notify_created(res->resource_id, hm->iosurface_id);
 
     /* Lock CPU mapping for host RAM access */
     int ret = macos_hostmem_map_resource(g, res);
@@ -274,7 +326,7 @@ static void macos_hostmem_destroy_resource(VirtIOGPU *g, struct virtio_gpu_simpl
     struct VirtIOGPUMacOSHostMem *hm = (struct VirtIOGPUMacOSHostMem *)res->hostmem_priv;
 
     /* Notify Aperture before releasing the surface so host can stop sampling it. */
-    gpu_sock_notify_destroyed(res->resource_id);
+    virtio_gpu_hostmem_notify_destroyed(res->resource_id);
 
     res->hostmem_priv = NULL;
 

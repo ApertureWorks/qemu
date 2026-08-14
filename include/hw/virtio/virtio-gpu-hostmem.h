@@ -29,6 +29,9 @@ void virtio_gpu_hostmem_destroy_resource(VirtIOGPU *g, struct virtio_gpu_simple_
 int virtio_gpu_hostmem_map_resource(VirtIOGPU *g, struct virtio_gpu_simple_resource *res);
 void virtio_gpu_hostmem_unmap_resource(VirtIOGPU *g, struct virtio_gpu_simple_resource *res);
 
+void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_id);
+void virtio_gpu_hostmem_notify_destroyed(uint32_t resource_id);
+
 void *virtio_gpu_hostmem_get_iosurface(struct virtio_gpu_simple_resource *res);
 uint32_t virtio_gpu_hostmem_get_iosurface_id(struct virtio_gpu_simple_resource *res);
 

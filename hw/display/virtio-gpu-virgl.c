@@ -19,6 +19,7 @@
 #include "hw/virtio/virtio-gpu.h"
 #include "hw/virtio/virtio-gpu-bswap.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
+#include "hw/virtio/virtio-gpu-hostmem.h"
 
 #include "ui/egl-helpers.h"
 
@@ -431,6 +432,12 @@ virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
         virtio_gpu_cleanup_mapping_iov(g, res_iovs, num_iovs);
     }
     virgl_renderer_resource_unref(res->base.resource_id);
+
+#if defined(CONFIG_DARWIN) || defined(__APPLE__)
+    if (res->base.dmabuf_fd > 0) {
+        virtio_gpu_hostmem_notify_destroyed(res->base.resource_id);
+    }
+#endif
 
     QTAILQ_REMOVE(&g->reslist, &res->base, next);
 
@@ -889,6 +896,13 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
     }
 
     res->base.dmabuf_fd = info.fd;
+
+#if defined(CONFIG_DARWIN) || defined(__APPLE__)
+    /* For zero-copy on macOS, the fd returned by virglrenderer is actually the IOSurface ID */
+    if (info.fd > 0) {
+        virtio_gpu_hostmem_notify_created(cblob.resource_id, (uint32_t)info.fd);
+    }
+#endif
 
     /* Now live, cleaned up in virtio_gpu_virgl_resource_unref */
     QTAILQ_INSERT_HEAD(&g->reslist, &res->base, next);
