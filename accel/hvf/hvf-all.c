@@ -114,13 +114,15 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
     if (!QEMU_IS_ALIGNED(size, page_size) ||
         !QEMU_IS_ALIGNED(gpa, page_size)) {
         /* Not page aligned, so we can not map as RAM */
-        add = false;
+        return;
     }
 
     if (!add) {
         trace_hvf_vm_unmap(gpa, size);
         ret = hv_vm_unmap(gpa, size);
-        assert_hvf_ok(ret);
+        if (ret != HV_SUCCESS && ret != HV_BAD_ARGUMENT) {
+            assert_hvf_ok(ret);
+        }
         return;
     }
 
@@ -131,7 +133,10 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
                      flags & HV_MEMORY_READ ?  'R' : '-',
                      flags & HV_MEMORY_WRITE ? 'W' : '-',
                      flags & HV_MEMORY_EXEC ?  'X' : '-');
+    hv_vm_unmap(gpa, size);
     ret = hv_vm_map(mem, gpa, size, flags);
+    fprintf(stderr, "[HVF-SET-PHYS-MEM] gpa=0x%llx size=0x%llx mem=%p ret=%d\n",
+            (unsigned long long)gpa, (unsigned long long)size, mem, ret);
     assert_hvf_ok(ret);
 }
 

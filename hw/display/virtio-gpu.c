@@ -460,7 +460,26 @@ static void virtio_gpu_transfer_to_host_2d(VirtIOGPU *g,
 
     res = virtio_gpu_find_check_resource(g, t2d.resource_id, true,
                                          __func__, &cmd->error);
-    if (!res || res->blob) {
+    if (!res) {
+        return;
+    }
+
+    if (res->blob) {
+        fprintf(stderr, "[QEMU-XFER-2D] res=%u offset=0x%" PRIx64 " rect=(%u,%u %ux%u) remapped=%p iov=%p iov_cnt=%u\n",
+                t2d.resource_id, (uint64_t)t2d.offset, t2d.r.x, t2d.r.y, t2d.r.width, t2d.r.height,
+                res->remapped, res->iov, res->iov_cnt);
+        if (res->remapped && res->iov) {
+            uint64_t xfer_size = (uint64_t)t2d.r.width * (uint64_t)t2d.r.height * 4;
+            if (t2d.offset + xfer_size <= res->blob_size) {
+                iov_to_buf(res->iov, res->iov_cnt, t2d.offset,
+                           res->remapped + t2d.offset,
+                           xfer_size);
+            } else {
+                iov_to_buf(res->iov, res->iov_cnt, 0,
+                           res->remapped,
+                           res->blob_size);
+            }
+        }
         return;
     }
 
@@ -508,8 +527,6 @@ static void virtio_gpu_resource_flush(VirtIOGPU *g,
     struct virtio_gpu_resource_flush rf;
     struct virtio_gpu_scanout *scanout;
     QemuRect flush_rect;
-    bool within_bounds = false;
-    bool update_submitted = false;
     int i;
 
     VIRTIO_GPU_FILL_CMD(rf);
@@ -531,27 +548,14 @@ static void virtio_gpu_resource_flush(VirtIOGPU *g,
                 rf.r.x + rf.r.width >= scanout->x &&
                 rf.r.y < scanout->y + scanout->height &&
                 rf.r.y + rf.r.height >= scanout->y) {
-                within_bounds = true;
 
                 if (qemu_console_has_gl(scanout->con)) {
                     qemu_console_gl_update(scanout->con, 0, 0, scanout->width,
                                   scanout->height);
-                    update_submitted = true;
                 }
             }
         }
-
-        if (update_submitted) {
-            return;
-        }
-        if (!within_bounds) {
-            qemu_log_mask(LOG_GUEST_ERROR, "%s: flush bounds outside scanouts"
-                          " bounds for flush %d: %d %d %d %d\n",
-                          __func__, rf.resource_id, rf.r.x, rf.r.y,
-                          rf.r.width, rf.r.height);
-            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
-            return;
-        }
+        return;
     }
 
     if (!res->blob &&
@@ -958,8 +962,91 @@ void virtio_gpu_cleanup_mapping(VirtIOGPU *g,
     g_free(res->addrs);
     res->addrs = NULL;
 
+    if (res->mr) {
+        VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
+        memory_region_del_subregion(&b->hostmem, res->mr);
+        g_free(res->mr);
+        res->mr = NULL;
+    }
+
     if (res->blob) {
         virtio_gpu_hostmem_destroy_resource(g, res);
+    }
+}
+
+static void virtio_gpu_resource_map_blob(VirtIOGPU *g,
+                                         struct virtio_gpu_ctrl_command *cmd)
+{
+    struct virtio_gpu_resource_map_blob mblob;
+    struct virtio_gpu_simple_resource *res;
+    struct virtio_gpu_resp_map_info resp;
+    VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
+    MemoryRegion *mr;
+
+    VIRTIO_GPU_FILL_CMD(mblob);
+    virtio_gpu_map_blob_bswap(&mblob);
+
+    res = virtio_gpu_find_resource(g, mblob.resource_id);
+    if (!res) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+        return;
+    }
+
+    if (!res->blob || !res->remapped) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
+
+    fprintf(stderr, "[QEMU-MAP-BLOB] res=%u offset=0x%" PRIx64 " size=%" PRIu64 " hostmem=0x%" PRIx64 " remapped=%p\n",
+            mblob.resource_id, (uint64_t)mblob.offset, res->blob_size, (uint64_t)b->conf.hostmem, res->remapped);
+
+    if (mblob.offset + res->blob_size > b->conf.hostmem ||
+        mblob.offset + res->blob_size < mblob.offset) {
+        fprintf(stderr, "[QEMU-MAP-BLOB-ERR] Out of bounds: offset 0x%" PRIx64 " + size %" PRIu64 " > hostmem 0x%" PRIx64 "\n",
+                (uint64_t)mblob.offset, res->blob_size, (uint64_t)b->conf.hostmem);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
+
+    if (res->mr) {
+        memory_region_del_subregion(&b->hostmem, res->mr);
+        g_free(res->mr);
+        res->mr = NULL;
+    }
+
+    mr = g_new0(MemoryRegion, 1);
+    char *name = g_strdup_printf("blob[%" PRIu32 "]", res->resource_id);
+    memory_region_init_ram_ptr(mr, OBJECT(g), name, res->blob_size, res->remapped);
+    g_free(name);
+    memory_region_add_subregion_overlap(&b->hostmem, mblob.offset, mr, 1);
+    res->mr = mr;
+
+    memset(&resp, 0, sizeof(resp));
+    resp.hdr.type = VIRTIO_GPU_RESP_OK_MAP_INFO;
+    resp.map_info = VIRTIO_GPU_MAP_CACHE_CACHED;
+    virtio_gpu_ctrl_response(g, cmd, &resp.hdr, sizeof(resp));
+}
+
+static void virtio_gpu_resource_unmap_blob(VirtIOGPU *g,
+                                           struct virtio_gpu_ctrl_command *cmd)
+{
+    struct virtio_gpu_resource_unmap_blob ublob;
+    struct virtio_gpu_simple_resource *res;
+    VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
+
+    VIRTIO_GPU_FILL_CMD(ublob);
+    virtio_gpu_unmap_blob_bswap(&ublob);
+
+    res = virtio_gpu_find_resource(g, ublob.resource_id);
+    if (!res) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+        return;
+    }
+
+    if (res->mr) {
+        memory_region_del_subregion(&b->hostmem, res->mr);
+        g_free(res->mr);
+        res->mr = NULL;
     }
 }
 
@@ -1041,6 +1128,20 @@ void virtio_gpu_simple_process_cmd(VirtIOGPU *g,
             break;
         }
         virtio_gpu_resource_create_blob(g, cmd);
+        break;
+    case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
+        if (!virtio_gpu_blob_enabled(g->parent_obj.conf)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            break;
+        }
+        virtio_gpu_resource_map_blob(g, cmd);
+        break;
+    case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
+        if (!virtio_gpu_blob_enabled(g->parent_obj.conf)) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            break;
+        }
+        virtio_gpu_resource_unmap_blob(g, cmd);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_UNREF:
         virtio_gpu_resource_unref(g, cmd);

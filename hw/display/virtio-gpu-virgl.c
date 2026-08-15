@@ -21,6 +21,14 @@
 #include "hw/virtio/virtio-gpu-pixman.h"
 #include "hw/virtio/virtio-gpu-hostmem.h"
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#if defined(__aarch64__)
+#include <Hypervisor/Hypervisor.h>
+#endif
+#endif
+
 #include "ui/egl-helpers.h"
 
 #include <virglrenderer.h>
@@ -173,7 +181,7 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
         return -EOPNOTSUPP;
     }
 
-#if VIRGL_HAS_MAP_FIXED
+#if VIRGL_HAS_MAP_FIXED && !defined(__APPLE__)
     /*
      * virgl_renderer_resource_map_fixed() allows to create multiple
      * mappings of the same resource, while virgl_renderer_resource_map()
@@ -194,9 +202,11 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
         return 0;
 
     case -EOPNOTSUPP:
+    case -EINVAL:
+    case -EBADF:
         /*
-         * MAP_FIXED is unsupported by this resource.
-         * Mapping falls back to a blob subregion method in that case.
+         * MAP_FIXED is unsupported by this resource (e.g. fd is an IOSurfaceID on macOS).
+         * Mapping falls back to a blob subregion / vm_remap method in that case.
          */
         break;
 
@@ -209,26 +219,54 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
 #endif
 
     ret = virgl_renderer_resource_map(res->base.resource_id, &data, &size);
+    fprintf(stderr, "[VIRGL-MAP-BLOB-CALL] res_id=%u ret=%d data=%p size=%llu\n",
+            res->base.resource_id, ret, data, (unsigned long long)size);
     if (ret) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to map virgl resource: %s\n",
                       __func__, strerror(-ret));
         return ret;
     }
 
-    vmr = g_new0(struct virtio_gpu_virgl_hostmem_region, 1);
-    name = g_strdup_printf("blob[%" PRIu32 "]", res->base.resource_id);
-    object_initialize_child(OBJECT(g), name, vmr,
-                            TYPE_VIRTIO_GPU_VIRGL_HOSTMEM_REGION);
-    vmr->g = g;
-    vmr->mapping_state = VIRTIO_GPU_MR_MAPPED;
+#ifdef __APPLE__
+    if (gl->hostmem_mmap) {
+        vm_address_t target = (vm_address_t)(gl->hostmem_mmap + offset);
+        vm_prot_t cur_prot, max_prot;
+        kern_return_t kr = vm_remap(mach_task_self(),
+                                    &target,
+                                    size,
+                                    0,
+                                    VM_FLAGS_OVERWRITE | VM_FLAGS_FIXED,
+                                    mach_task_self(),
+                                    (vm_address_t)data,
+                                    FALSE,
+                                    &cur_prot,
+                                    &max_prot,
+                                    VM_INHERIT_NONE);
+        if (kr == KERN_SUCCESS) {
+            res->map_fixed = (void *)target;
+            fprintf(stderr, "[VIRGL-MAP-BLOB-VM-REMAP-OK] res_id=%u target=%p size=%llu\n",
+                    res->base.resource_id, (void*)target, (unsigned long long)size);
+        } else {
+            fprintf(stderr, "[VIRGL-MAP-BLOB-VM-REMAP-FAIL] res_id=%u kr=%d target=%p data=%p size=%llu\n",
+                    res->base.resource_id, kr, (void*)target, data, (unsigned long long)size);
+        }
 
-    mr = &vmr->mr;
-    memory_region_init_ram_ptr(mr, OBJECT(vmr), "mr", size, data);
-    memory_region_add_subregion_overlap(&b->hostmem, offset, mr, 1);
+#if defined(__APPLE__) && defined(__aarch64__)
+        hwaddr bar_base = b->hostmem.addr;
+        uint64_t page_size = qemu_real_host_page_size();
+        uint64_t start_gpa = QEMU_ALIGN_DOWN(bar_base + offset, page_size);
+        uint64_t end_gpa = QEMU_ALIGN_UP(bar_base + offset + size, page_size);
+        uint64_t aligned_size = end_gpa - start_gpa;
+        void *aligned_uva = (void *)((uintptr_t)gl->hostmem_mmap + (start_gpa - bar_base));
 
-    res->mr = mr;
-
-    trace_virtio_gpu_cmd_res_map_blob(res->base.resource_id, vmr, mr);
+        hv_vm_unmap(start_gpa, aligned_size);
+        hv_return_t hv_ret = hv_vm_map(aligned_uva, start_gpa, aligned_size,
+                                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+        fprintf(stderr, "[VIRGL-HVF-STAGE2-MAP] res_id=%u gpa=0x%llx size=0x%llx uva=%p ret=%d\n",
+                res->base.resource_id, (unsigned long long)start_gpa, (unsigned long long)aligned_size, aligned_uva, hv_ret);
+#endif
+    }
+#endif
 
     return 0;
 }
@@ -238,44 +276,38 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
                                      struct virtio_gpu_virgl_resource *res,
                                      bool *cmd_suspended)
 {
-    struct virtio_gpu_virgl_hostmem_region *vmr;
     VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
-    MemoryRegion *mr = res->mr;
-    int ret;
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
 
-#if VIRGL_HAS_MAP_FIXED
-    if (res->map_fixed) {
-        if (mmap(res->map_fixed, res->base.blob_size, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                 -1, 0) == MAP_FAILED) {
-            ret = -errno;
-            error_report("%s: failed to unmap(fixed) virgl resource: %s",
-                          __func__, strerror(-ret));
-            return ret;
-        }
+#ifdef __APPLE__
+    if (res->map_fixed && gl->hostmem_mmap) {
+        mmap(res->map_fixed, res->base.blob_size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 
+#if defined(__APPLE__) && defined(__aarch64__)
+        hwaddr bar_base = b->hostmem.addr;
+        uint64_t page_size = qemu_real_host_page_size();
+        uint64_t offset = (uintptr_t)res->map_fixed - (uintptr_t)gl->hostmem_mmap;
+        uint64_t start_gpa = QEMU_ALIGN_DOWN(bar_base + offset, page_size);
+        uint64_t end_gpa = QEMU_ALIGN_UP(bar_base + offset + res->base.blob_size, page_size);
+        uint64_t aligned_size = end_gpa - start_gpa;
+        void *aligned_uva = (void *)((uintptr_t)gl->hostmem_mmap + (start_gpa - bar_base));
+
+        hv_vm_unmap(start_gpa, aligned_size);
+        hv_vm_map(aligned_uva, start_gpa, aligned_size,
+                  HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+#endif
         res->map_fixed = NULL;
     }
-#endif
-
-    if (!mr) {
-        return 0;
-    }
-
-    vmr = to_hostmem_region(res->mr);
+    return 0;
+#else
+    struct virtio_gpu_virgl_hostmem_region *vmr;
+    MemoryRegion *mr = res->mr;
+    int ret;
 
     trace_virtio_gpu_cmd_res_unmap_blob(res->base.resource_id, mr,
                                         vmr->mapping_state);
 
-    /*
-     * Perform async unmapping in 3 steps:
-     *
-     * 1. Begin async unmapping with memory_region_del_subregion()
-     *    and suspend/block cmd processing.
-     * 2. Wait for res->mr to be freed and cmd processing resumed
-     *    asynchronously by virtio_gpu_virgl_hostmem_region_finalize().
-     * 3. Finish the unmapping with final virgl_renderer_resource_unmap().
-     */
     switch (vmr->mapping_state) {
     case VIRTIO_GPU_MR_UNMAP_COMPLETED:
         res->mr = NULL;
@@ -291,15 +323,10 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
         break;
 
     case VIRTIO_GPU_MR_MAPPED:
-        /* render will be unblocked once MR is freed */
         b->renderer_blocked++;
-
         vmr->mapping_state = VIRTIO_GPU_MR_UNMAP_STARTED;
-
-        /* memory region owns self res->mr object and frees it by itself */
         memory_region_del_subregion(&b->hostmem, mr);
         object_unparent(OBJECT(vmr));
-
         /* Fallthrough */
     case VIRTIO_GPU_MR_UNMAP_STARTED:
         *cmd_suspended = true;
@@ -307,6 +334,7 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
     }
 
     return 0;
+#endif
 }
 #endif
 
@@ -487,11 +515,12 @@ static void virgl_cmd_context_create(VirtIOGPU *g,
     struct virtio_gpu_ctx_create cc;
 
     VIRTIO_GPU_FILL_CMD(cc);
-    trace_virtio_gpu_cmd_ctx_create(cc.hdr.ctx_id,
-                                    cc.debug_name);
+    fprintf(stderr, "[VIRGL-CTX-CREATE] ctx_id=%u context_init=0x%x nlen=%u name=%s\n",
+            cc.hdr.ctx_id, cc.context_init, cc.nlen, cc.debug_name);
 
     if (cc.context_init) {
         if (!virtio_gpu_context_init_enabled(g->parent_obj.conf)) {
+            fprintf(stderr, "[VIRGL-CTX-CREATE-ERR] context_init disabled in conf\n");
             qemu_log_mask(LOG_GUEST_ERROR, "%s: context_init disabled",
                           __func__);
             cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
@@ -637,7 +666,13 @@ static void virgl_cmd_submit_3d(VirtIOGPU *g,
         g->stats.bytes_3d += cs.size;
     }
 
-    virgl_renderer_submit_cmd(buf, cs.hdr.ctx_id, cs.size / 4);
+    int ret = virgl_renderer_submit_cmd(buf, cs.hdr.ctx_id, cs.size / 4);
+    if (ret) {
+        fprintf(stderr, "[VIRGL-SUBMIT-FAIL] ctx_id=%u size=%u ret=%d\n", cs.hdr.ctx_id, cs.size, ret);
+        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+    } else {
+        fprintf(stderr, "[VIRGL-SUBMIT-OK] ctx_id=%u size=%u\n", cs.hdr.ctx_id, cs.size);
+    }
 
 out:
     g_free(buf);
@@ -835,6 +870,8 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
 
     VIRTIO_GPU_FILL_CMD(cblob);
     virtio_gpu_create_blob_bswap(&cblob);
+    fprintf(stderr, "[QEMU-BLOB-CREATE] res=%u blob_mem=0x%x blob_flags=0x%x size=%" PRIu64 " blob_id=0x%" PRIx64 "\n",
+            cblob.resource_id, cblob.blob_mem, cblob.blob_flags, (uint64_t)cblob.size, (uint64_t)cblob.blob_id);
     trace_virtio_gpu_cmd_res_create_blob(cblob.resource_id, cblob.size);
 
     if (cblob.resource_id == 0) {
@@ -920,6 +957,9 @@ static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
 
     VIRTIO_GPU_FILL_CMD(mblob);
     virtio_gpu_map_blob_bswap(&mblob);
+
+    fprintf(stderr, "[VIRGL-MAP-BLOB-CMD] res_id=%u offset=0x%llx\n",
+            mblob.resource_id, (unsigned long long)mblob.offset);
 
     res = virtio_gpu_virgl_find_resource(g, mblob.resource_id);
     if (!res) {
@@ -1473,6 +1513,9 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
 #if VIRGL_VERSION_MAJOR >= 1
     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
+#ifdef __APPLE__
+        flags |= VIRGL_RENDERER_NO_VIRGL;
+#endif
     }
     if (virtio_gpu_drm_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_DRM;
