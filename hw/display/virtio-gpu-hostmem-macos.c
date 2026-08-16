@@ -10,6 +10,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
+#include "qemu/iov.h"
+#include "hw/virtio/virtio-gpu.h"
 #include "hw/virtio/virtio-gpu-hostmem.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -22,34 +25,114 @@
 #define MAX_BLOB_SIZE (1ULL << 40)
 
 /*
- * gpu_sock_notify_created / gpu_sock_notify_destroyed
+ * Persistent bidirectional Unix Domain Socket channel (gpu.sock)
  *
- * Notify Aperture's GPUControlServer of blob resource lifecycle events.
- * Wire format (big-endian, Option B — IDs only):
- *
- *   GPUResourceCreated  (9 bytes): [0x01][4B resource_id][4B iosurface_id]
- *   GPUResourceDestroyed (5 bytes): [0x02][4B resource_id]
- *
- * Each call opens a new AF_UNIX connection, sends the packet with MSG_DONTWAIT
- * (so the QEMU main loop is NEVER blocked by a slow host receiver), and closes.
- * connect() failing is intentionally silent — GPUControlServer may not be
- * started for H.264 sessions.
+ * Wire protocol:
+ *   [0x01][4B resource_id][4B iosurface_id] - GPUResourceCreated  (QEMU -> Host)
+ *   [0x02][4B resource_id]                  - GPUResourceDestroyed (QEMU -> Host)
+ *   [0x03][4B resource_id]                  - CMD_TRANSFER_RESOURCE (Host -> QEMU)
+ *   [0x04][4B resource_id]                  - CMD_TRANSFER_DONE     (QEMU -> Host)
  */
 static const char *aperture_gpu_sock_path(void)
 {
     return getenv("APERTURE_GPU_SOCK");
 }
 
-static void gpu_sock_send(const uint8_t *buf, size_t len)
+static int s_gpu_sock_fd = -1;
+static VirtIOGPU *s_gpu_device = NULL;
+
+static void gpu_sock_disconnect(void)
 {
+    if (s_gpu_sock_fd >= 0) {
+        qemu_set_fd_handler(s_gpu_sock_fd, NULL, NULL, NULL);
+        close(s_gpu_sock_fd);
+        s_gpu_sock_fd = -1;
+    }
+}
+
+static void gpu_sock_read_cb(void *opaque)
+{
+    VirtIOGPU *g = (VirtIOGPU *)opaque;
+    if (s_gpu_sock_fd < 0) {
+        return;
+    }
+
+    uint8_t header;
+    ssize_t n = recv(s_gpu_sock_fd, &header, 1, MSG_DONTWAIT);
+    if (n <= 0) {
+        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+            gpu_sock_disconnect();
+        }
+        return;
+    }
+
+    if (header == 0x03) {
+        /* CMD_TRANSFER_RESOURCE: 4 bytes big-endian resource_id */
+        uint8_t res_buf[4];
+        size_t recvd = 0;
+        while (recvd < 4) {
+            ssize_t r = recv(s_gpu_sock_fd, res_buf + recvd, 4 - recvd, 0);
+            if (r <= 0) {
+                gpu_sock_disconnect();
+                return;
+            }
+            recvd += (size_t)r;
+        }
+
+        uint32_t resource_id = ((uint32_t)res_buf[0] << 24) |
+                               ((uint32_t)res_buf[1] << 16) |
+                               ((uint32_t)res_buf[2] <<  8) |
+                               ((uint32_t)res_buf[3]);
+
+        /* Execute Zero-Encode Host-Initiated Direct Frame Transfer */
+        if (g || s_gpu_device) {
+            VirtIOGPU *dev = g ? g : s_gpu_device;
+            struct virtio_gpu_simple_resource *res = virtio_gpu_find_resource(dev, resource_id);
+            if (res && res->remapped && res->iov) {
+                iov_to_buf(res->iov, res->iov_cnt, 0, res->remapped, res->blob_size);
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "[QEMU-HostMem] Transfer requested for missing or unmapped res_id=%u (ignoring safely)\n",
+                              resource_id);
+            }
+        }
+
+        /* Send CMD_TRANSFER_DONE ack: [0x04][4B resource_id] */
+        uint8_t ack[5];
+        ack[0] = 0x04;
+        ack[1] = res_buf[0];
+        ack[2] = res_buf[1];
+        ack[3] = res_buf[2];
+        ack[4] = res_buf[3];
+
+        size_t sent = 0;
+        while (sent < sizeof(ack) && s_gpu_sock_fd >= 0) {
+            ssize_t s = send(s_gpu_sock_fd, ack + sent, sizeof(ack) - sent, MSG_DONTWAIT);
+            if (s <= 0) {
+                if (s < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+                    gpu_sock_disconnect();
+                }
+                break;
+            }
+            sent += (size_t)s;
+        }
+    }
+}
+
+static int gpu_sock_ensure_connected(void)
+{
+    if (s_gpu_sock_fd >= 0) {
+        return s_gpu_sock_fd;
+    }
+
     const char *sock_path = aperture_gpu_sock_path();
     if (!sock_path || *sock_path == '\0') {
-        return;
+        return -1;
     }
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        return;
+        return -1;
     }
 
     struct sockaddr_un addr;
@@ -58,23 +141,33 @@ static void gpu_sock_send(const uint8_t *buf, size_t len)
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        /* GPUControlServer not yet listening or not a zero-copy session. */
         close(fd);
+        return -1;
+    }
+
+    s_gpu_sock_fd = fd;
+    qemu_set_fd_handler(s_gpu_sock_fd, gpu_sock_read_cb, NULL, s_gpu_device);
+    return s_gpu_sock_fd;
+}
+
+static void gpu_sock_send(const uint8_t *buf, size_t len)
+{
+    int fd = gpu_sock_ensure_connected();
+    if (fd < 0) {
         return;
     }
 
-    /* Best-effort non-blocking send. If the host is slow, we drop this event
-     * rather than stalling the QEMU main loop. The next frame will re-sync. */
     size_t sent = 0;
-    while (sent < len) {
+    while (sent < len && s_gpu_sock_fd >= 0) {
         ssize_t n = send(fd, buf + sent, len - sent, MSG_DONTWAIT);
         if (n <= 0) {
+            if (n < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+                gpu_sock_disconnect();
+            }
             break;
         }
         sent += (size_t)n;
     }
-
-    close(fd);
 }
 
 void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_id)
@@ -190,9 +283,10 @@ static void macos_hostmem_unmap_resource(VirtIOGPU *g, struct virtio_gpu_simple_
 
 static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_resource *res)
 {
-    if (!res) {
+    if (!g || !res) {
         return -EINVAL;
     }
+    s_gpu_device = g;
 
     size_t page_size = getpagesize();
 
