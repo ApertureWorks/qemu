@@ -35,7 +35,11 @@
  */
 static const char *aperture_gpu_sock_path(void)
 {
-    return getenv("APERTURE_GPU_SOCK");
+    const char *p = getenv("APERTURE_GPU_SOCK");
+    if (!p || *p == '\0') {
+        return "/tmp/aperture_gpu.sock";
+    }
+    return p;
 }
 
 static int s_gpu_sock_fd = -1;
@@ -90,6 +94,31 @@ static void gpu_sock_read_cb(void *opaque)
             struct virtio_gpu_simple_resource *res = virtio_gpu_find_resource(dev, resource_id);
             if (res && res->remapped && res->iov) {
                 iov_to_buf(res->iov, res->iov_cnt, 0, res->remapped, res->blob_size);
+
+                uint32_t *pixels = (uint32_t *)res->remapped;
+                size_t pixel_count = res->blob_size / 4;
+                size_t non_zero = 0;
+                uint32_t first_pixel = 0;
+                for (size_t i = 0; i < pixel_count; i++) {
+                    if (pixels[i] != 0) {
+                        non_zero++;
+                        if (first_pixel == 0) first_pixel = pixels[i];
+                    }
+                }
+                fprintf(stderr, "[QEMU-HOSTMEM-AUDIT] res_id=%u: non_zero=%zu/%zu (first=0x%08X)\n",
+                        resource_id, non_zero, pixel_count, first_pixel);
+                FILE *af = fopen("/tmp/aperture_2d_audit.txt", "w");
+                if (af) {
+                    fprintf(af, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
+                            resource_id, non_zero, pixel_count, first_pixel);
+                    fclose(af);
+                }
+                FILE *wf = fopen("/Users/skanda/Documents/Coding Projects/Aperture/virglrender/build/2d_audit.txt", "w");
+                if (wf) {
+                    fprintf(wf, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
+                            resource_id, non_zero, pixel_count, first_pixel);
+                    fclose(wf);
+                }
             } else {
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "[QEMU-HostMem] Transfer requested for missing or unmapped res_id=%u (ignoring safely)\n",
@@ -138,13 +167,31 @@ static int gpu_sock_ensure_connected(void)
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
+    addr.sun_len = sizeof(addr);
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return -1;
+        int err1 = errno;
+        /* Try /private/tmp variant if sock_path starts with /tmp */
+        if (strncmp(sock_path, "/tmp/", 5) == 0) {
+            char priv_path[256];
+            snprintf(priv_path, sizeof(priv_path), "/private%s", sock_path);
+            strncpy(addr.sun_path, priv_path, sizeof(addr.sun_path) - 1);
+            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+                fprintf(stderr, "[QEMU-HOSTMEM-SOCK] connect failed for %s (%s) and %s (%s)\n",
+                        sock_path, strerror(err1), priv_path, strerror(errno));
+                close(fd);
+                return -1;
+            }
+        } else {
+            fprintf(stderr, "[QEMU-HOSTMEM-SOCK] connect failed for %s: errno=%d (%s)\n",
+                    sock_path, err1, strerror(err1));
+            close(fd);
+            return -1;
+        }
     }
 
+    fprintf(stderr, "[QEMU-HOSTMEM-SOCK] Successfully connected to %s (fd=%d)\n", addr.sun_path, fd);
     s_gpu_sock_fd = fd;
     qemu_set_fd_handler(s_gpu_sock_fd, gpu_sock_read_cb, NULL, s_gpu_device);
     return s_gpu_sock_fd;
@@ -170,8 +217,26 @@ static void gpu_sock_send(const uint8_t *buf, size_t len)
     }
 }
 
+__attribute__((visibility("default")))
 void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_id)
 {
+    fprintf(stderr, "[QEMU-HOSTMEM-NOTIFY-CREATED] res_id=%u, iosurf_id=%u\n", resource_id, iosurface_id);
+    FILE *f = fopen("/tmp/aperture_latest_2d_iosurface.txt", "w");
+    if (f) {
+        fprintf(f, "%u %u\n", resource_id, iosurface_id);
+        fclose(f);
+    }
+    FILE *pf = fopen("/private/tmp/aperture_latest_2d_iosurface.txt", "w");
+    if (pf) {
+        fprintf(pf, "%u %u\n", resource_id, iosurface_id);
+        fclose(pf);
+    }
+    FILE *wf = fopen("/Users/skanda/Documents/Coding Projects/Aperture/virglrender/build/latest_2d_iosurface.txt", "w");
+    if (wf) {
+        fprintf(wf, "%u %u\n", resource_id, iosurface_id);
+        fclose(wf);
+    }
+
     uint8_t buf[9];
     buf[0] = 0x01;
     buf[1] = (resource_id  >> 24) & 0xFF;
@@ -185,6 +250,7 @@ void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_
     gpu_sock_send(buf, sizeof(buf));
 }
 
+__attribute__((visibility("default")))
 void virtio_gpu_hostmem_notify_destroyed(uint32_t resource_id)
 {
     uint8_t buf[5];

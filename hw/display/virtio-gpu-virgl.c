@@ -462,7 +462,9 @@ virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
     virgl_renderer_resource_unref(res->base.resource_id);
 
 #if defined(CONFIG_DARWIN) || defined(__APPLE__)
-    if (res->base.dmabuf_fd > 0) {
+    if (res->base.hostmem_priv) {
+        virtio_gpu_hostmem_destroy_resource(g, &res->base);
+    } else if (res->base.dmabuf_fd > 0) {
         virtio_gpu_hostmem_notify_destroyed(res->base.resource_id);
     }
 #endif
@@ -686,6 +688,40 @@ static void virgl_cmd_transfer_to_host_2d(VirtIOGPU *g,
 
     VIRTIO_GPU_FILL_CMD(t2d);
     trace_virtio_gpu_cmd_res_xfer_toh_2d(t2d.resource_id);
+
+    struct virtio_gpu_virgl_resource *res = virtio_gpu_virgl_find_resource(g, t2d.resource_id);
+    if (res && res->base.remapped && res->base.iov && res->base.iov_cnt > 0) {
+        iov_to_buf(res->base.iov, res->base.iov_cnt, t2d.offset,
+                   res->base.remapped + t2d.offset,
+                   res->base.blob_size > t2d.offset ? res->base.blob_size - t2d.offset : 0);
+
+        size_t pixel_count = res->base.blob_size / 4;
+        uint32_t *pixels = (uint32_t *)res->base.remapped;
+        size_t non_zero = 0;
+        uint32_t first_pixel = 0;
+        for (size_t i = 0; i < pixel_count; i++) {
+            if (pixels[i] != 0) {
+                non_zero++;
+                if (first_pixel == 0) first_pixel = pixels[i];
+            }
+        }
+        if (non_zero > 0) {
+            fprintf(stderr, "[QEMU-2D-TRANSFER] res_id=%u: non_zero=%zu/%zu (first=0x%08X)\n",
+                    t2d.resource_id, non_zero, pixel_count, first_pixel);
+            FILE *af = fopen("/tmp/aperture_2d_audit.txt", "w");
+            if (af) {
+                fprintf(af, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
+                        t2d.resource_id, non_zero, pixel_count, first_pixel);
+                fclose(af);
+            }
+            FILE *wf = fopen("/Users/skanda/Documents/Coding Projects/Aperture/virglrender/build/2d_audit.txt", "w");
+            if (wf) {
+                fprintf(wf, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
+                        t2d.resource_id, non_zero, pixel_count, first_pixel);
+                fclose(wf);
+            }
+        }
+    }
 
     box.x = t2d.r.x;
     box.y = t2d.r.y;
@@ -938,6 +974,8 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
     /* For zero-copy on macOS, the fd returned by virglrenderer is actually the IOSurface ID */
     if (info.fd > 0) {
         virtio_gpu_hostmem_notify_created(cblob.resource_id, (uint32_t)info.fd);
+    } else if (res->base.blob_size > 0) {
+        virtio_gpu_hostmem_create_resource(g, &res->base);
     }
 #endif
 

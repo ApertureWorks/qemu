@@ -843,13 +843,11 @@ if host_os == 'windows'
   version_res = win.compile_resources('version.rc',
                                       depend_files: files('pc-bios/qemu-nsis.ico'),
                                       include_directories: include_directories('.'))
-  host_dsosuf = '.dll'
 elif host_os == 'darwin'
   coref = dependency('appleframeworks', modules: 'CoreFoundation')
   iokit = dependency('appleframeworks', modules: 'IOKit', required: false)
   host_dsosuf = '.dylib'
-  pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
-                   required: get_option('pvg'))
+  pvg = not_found
 elif host_os == 'sunos'
   socket = [cc.find_library('socket'),
             cc.find_library('nsl'),
