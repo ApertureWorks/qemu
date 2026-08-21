@@ -72,6 +72,22 @@ virtio_gpu_virgl_find_resource(VirtIOGPU *g, uint32_t resource_id)
     return container_of(res, struct virtio_gpu_virgl_resource, base);
 }
 
+/* Public helper — used by virtio-gpu-hostmem-macos.c to read blob pixel data.
+ * Returns the vm_remap'd host VA of the blob resource, or NULL if not a virgl
+ * blob resource or if the blob has not yet been mapped by the guest.
+ * blob_size_out (if non-NULL) is filled with the allocated blob size. */
+void *virtio_gpu_hostmem_get_blob_map(VirtIOGPU *g, uint32_t resource_id, size_t *blob_size_out)
+{
+    struct virtio_gpu_virgl_resource *vres = virtio_gpu_virgl_find_resource(g, resource_id);
+    if (!vres) {
+        return NULL;
+    }
+    if (blob_size_out) {
+        *blob_size_out = (size_t)vres->base.blob_size;
+    }
+    return vres->map_fixed;
+}
+
 #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
 static void *
 virgl_get_egl_display(G_GNUC_UNUSED void *cookie)
@@ -1601,6 +1617,17 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
                                                   virtio_gpu_virgl_async_fence_bh,
                                                   g);
 #endif
+#endif
+
+#ifdef __APPLE__
+    /* Initialize the gpu.sock BH and reconnect timer on the I/O thread.
+     * This MUST be called here (I/O thread context) so that qemu_bh_new,
+     * timer_new_ms, and qemu_set_fd_handler are all called from the correct thread. */
+    fprintf(stderr, "[VIRGL-INIT] Calling virtio_gpu_hostmem_init_iothread (I/O thread)\n");
+    fflush(stderr);
+    virtio_gpu_hostmem_init_iothread(g);
+    fprintf(stderr, "[VIRGL-INIT] virtio_gpu_hostmem_init_iothread returned\n");
+    fflush(stderr);
 #endif
 
     return 0;

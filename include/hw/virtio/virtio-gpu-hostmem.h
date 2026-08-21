@@ -35,6 +35,14 @@ void virtio_gpu_hostmem_notify_destroyed(uint32_t resource_id);
 void *virtio_gpu_hostmem_get_iosurface(struct virtio_gpu_simple_resource *res);
 uint32_t virtio_gpu_hostmem_get_iosurface_id(struct virtio_gpu_simple_resource *res);
 
+/* Returns the vm_remap'd host VA for a virgl blob resource (blob path),
+ * or NULL if the resource is not a mapped blob. blob_size_out may be NULL. */
+void *virtio_gpu_hostmem_get_blob_map(VirtIOGPU *g, uint32_t resource_id, size_t *blob_size_out);
+
+/* Called once from virtio_gpu_virgl_init() on the QEMU I/O thread to create
+ * the BH, reconnect timer, and attempt the first gpu.sock connection. */
+void virtio_gpu_hostmem_init_iothread(VirtIOGPU *g);
+
 /* Backend Vtables */
 
 extern const VirtIOGPUHostMemOps virtio_gpu_hostmem_linux_ops;

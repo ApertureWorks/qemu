@@ -42,16 +42,137 @@ static const char *aperture_gpu_sock_path(void)
     return p;
 }
 
+#include <stdatomic.h>
+
 static int s_gpu_sock_fd = -1;
 static VirtIOGPU *s_gpu_device = NULL;
+static QEMUTimer *s_gpu_sock_timer = NULL;
 
-static void gpu_sock_disconnect(void)
+/*
+ * Pending-notify ring: VKR threads write (resource_id, iosurface_id) pairs here;
+ * the QEMU I/O thread's BH drains them and sends the 0x01 notify over gpu.sock.
+ * Uses lock-free atomic read/write indices with a power-of-2 ring size.
+ */
+#define NOTIFY_RING_SIZE 128  /* must be power of 2 */
+typedef struct {
+    uint32_t resource_id;
+    uint32_t iosurface_id;
+} PendingNotify;
+
+static PendingNotify  s_notify_ring[NOTIFY_RING_SIZE];
+static _Atomic uint32_t s_notify_head = 0;  /* written by VKR threads */
+static _Atomic uint32_t s_notify_tail = 0;  /* read/drained by I/O thread */
+static QEMUBH *s_notify_bh = NULL;           /* scheduled by VKR threads, runs on I/O thread */
+
+static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_resource *res);
+static int gpu_sock_ensure_connected(void);
+
+static void gpu_sock_timer_cb(void *opaque)
 {
+    /* Runs on I/O thread — safe to call gpu_sock_ensure_connected. */
+    if (s_gpu_sock_fd < 0) {
+        if (gpu_sock_ensure_connected() < 0) {
+            if (s_gpu_sock_timer) {
+                timer_mod(s_gpu_sock_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 250);
+            }
+        }
+        /* If connection succeeded, drain any pending notifies. */
+    }
+    /* After connecting, drain the pending notify ring. */
+    if (s_gpu_sock_fd >= 0) {
+        uint32_t tail = atomic_load_explicit(&s_notify_tail, memory_order_acquire);
+        uint32_t head = atomic_load_explicit(&s_notify_head, memory_order_acquire);
+        while (tail != head) {
+            PendingNotify *pn = &s_notify_ring[tail & (NOTIFY_RING_SIZE - 1)];
+            uint8_t buf[9];
+            buf[0] = 0x01;
+            buf[1] = (pn->resource_id  >> 24) & 0xFF;
+            buf[2] = (pn->resource_id  >> 16) & 0xFF;
+            buf[3] = (pn->resource_id  >>  8) & 0xFF;
+            buf[4] = (pn->resource_id       ) & 0xFF;
+            buf[5] = (pn->iosurface_id >> 24) & 0xFF;
+            buf[6] = (pn->iosurface_id >> 16) & 0xFF;
+            buf[7] = (pn->iosurface_id >>  8) & 0xFF;
+            buf[8] = (pn->iosurface_id       ) & 0xFF;
+            ssize_t n = send(s_gpu_sock_fd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (n <= 0) { break; } /* will retry next timer fire or BH */
+            tail++;
+            atomic_store_explicit(&s_notify_tail, tail, memory_order_release);
+        }
+    }
+}
+
+/* Called from VKR threads — only schedules work; no I/O ops. */
+static void gpu_sock_schedule_reconnect(void)
+{
+    if (!s_gpu_sock_timer) {
+        /* Timer creation is safe only on the I/O thread.
+         * At first call we are on the I/O thread (device_realize),
+         * subsequent calls (from VKR threads) skip creation if already set. */
+        s_gpu_sock_timer = timer_new_ms(QEMU_CLOCK_REALTIME, gpu_sock_timer_cb, NULL);
+    }
+    if (s_gpu_sock_fd < 0 && s_gpu_sock_timer) {
+        timer_mod(s_gpu_sock_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+    }
+}
+
+/* BH handler — runs on I/O thread; drains pending notifies and retries connection. */
+static void gpu_notify_bh_handler(void *opaque)
+{
+    gpu_sock_timer_cb(NULL); /* reuse the same drain logic */
+}
+
+static void gpu_sock_disconnect(const char *reason)
+{
+    fprintf(stderr, "[QEMU-HOSTMEM-SOCK] 🔌 gpu_sock_disconnect called (fd=%d, reason='%s')\n", s_gpu_sock_fd, reason ? reason : "unknown");
+    fflush(stderr);
     if (s_gpu_sock_fd >= 0) {
         qemu_set_fd_handler(s_gpu_sock_fd, NULL, NULL, NULL);
         close(s_gpu_sock_fd);
         s_gpu_sock_fd = -1;
     }
+    gpu_sock_schedule_reconnect();
+}
+
+/*
+ * Called once from virtio_gpu_virgl_init() which runs on the QEMU I/O thread.
+ * Creates the BH and timer, and kicks the first connection attempt so QEMU
+ * connects to gpu.sock before the VKR threads begin issuing notify_created calls.
+ */
+__attribute__((visibility("default")))
+void virtio_gpu_hostmem_init_iothread(VirtIOGPU *g)
+{
+    fprintf(stderr, "[QEMU-HOSTMEM] virtio_gpu_hostmem_init_iothread called (g=%p)\n", (void*)g);
+    fflush(stderr);
+    if (g) {
+        s_gpu_device = g;
+    }
+    if (!s_notify_bh) {
+        s_notify_bh = qemu_bh_new(gpu_notify_bh_handler, NULL);
+        fprintf(stderr, "[QEMU-HOSTMEM] BH created (s_notify_bh=%p)\n", (void*)s_notify_bh);
+        fflush(stderr);
+    }
+    if (!s_gpu_sock_timer) {
+        s_gpu_sock_timer = timer_new_ms(QEMU_CLOCK_REALTIME, gpu_sock_timer_cb, NULL);
+        fprintf(stderr, "[QEMU-HOSTMEM] Timer created (s_gpu_sock_timer=%p)\n", (void*)s_gpu_sock_timer);
+        fflush(stderr);
+    }
+    /* Attempt immediate connection — succeeds if gpu.sock is already listening. */
+    if (s_gpu_sock_fd < 0) {
+        fprintf(stderr, "[QEMU-HOSTMEM] Attempting initial connection...\n");
+        fflush(stderr);
+        if (gpu_sock_ensure_connected() >= 0) {
+            fprintf(stderr, "[QEMU-HOSTMEM] Connected to gpu.sock at init (fd=%d)\n", s_gpu_sock_fd);
+            fflush(stderr);
+        } else {
+            /* Schedule first retry in 50ms */
+            timer_mod(s_gpu_sock_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 50);
+            fprintf(stderr, "[QEMU-HOSTMEM] gpu.sock not ready at init, retry in 50ms\n");
+            fflush(stderr);
+        }
+    }
+    fprintf(stderr, "[QEMU-HOSTMEM] init_iothread complete\n");
+    fflush(stderr);
 }
 
 static void gpu_sock_read_cb(void *opaque)
@@ -64,8 +185,12 @@ static void gpu_sock_read_cb(void *opaque)
     uint8_t header;
     ssize_t n = recv(s_gpu_sock_fd, &header, 1, MSG_DONTWAIT);
     if (n <= 0) {
-        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-            gpu_sock_disconnect();
+        if (n == 0) {
+            gpu_sock_disconnect("EOF on recv");
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            char reason_buf[128];
+            snprintf(reason_buf, sizeof(reason_buf), "recv error: %s (errno=%d)", strerror(errno), errno);
+            gpu_sock_disconnect(reason_buf);
         }
         return;
     }
@@ -77,7 +202,7 @@ static void gpu_sock_read_cb(void *opaque)
         while (recvd < 4) {
             ssize_t r = recv(s_gpu_sock_fd, res_buf + recvd, 4 - recvd, 0);
             if (r <= 0) {
-                gpu_sock_disconnect();
+                gpu_sock_disconnect("recv error reading resource_id payload");
                 return;
             }
             recvd += (size_t)r;
@@ -89,39 +214,114 @@ static void gpu_sock_read_cb(void *opaque)
                                ((uint32_t)res_buf[3]);
 
         /* Execute Zero-Encode Host-Initiated Direct Frame Transfer */
+        fprintf(stderr, "[QEMU-HOSTMEM] 0x03 cmd received for res_id=%u (g=%p, s_gpu_device=%p)\n", resource_id, g, s_gpu_device);
         if (g || s_gpu_device) {
             VirtIOGPU *dev = g ? g : s_gpu_device;
             struct virtio_gpu_simple_resource *res = virtio_gpu_find_resource(dev, resource_id);
-            if (res && res->remapped && res->iov) {
-                iov_to_buf(res->iov, res->iov_cnt, 0, res->remapped, res->blob_size);
-
-                uint32_t *pixels = (uint32_t *)res->remapped;
-                size_t pixel_count = res->blob_size / 4;
-                size_t non_zero = 0;
-                uint32_t first_pixel = 0;
-                for (size_t i = 0; i < pixel_count; i++) {
-                    if (pixels[i] != 0) {
-                        non_zero++;
-                        if (first_pixel == 0) first_pixel = pixels[i];
+            if (res) {
+                fprintf(stderr, "[QEMU-HOSTMEM] res %u found: blob_size=%" PRIu64 ", w=%u, h=%u, remapped=%p, iov=%p, iov_cnt=%u\n",
+                        resource_id, res->blob_size, res->width, res->height, res->remapped, res->iov, res->iov_cnt);
+                if (!res->remapped && !res->hostmem_priv) {
+                    if (res->blob_size == 0) {
+                        res->blob_size = (size_t)res->width * res->height * 4;
+                    }
+                    if (res->blob_size > 0) {
+                        macos_hostmem_create_resource(dev, res);
                     }
                 }
-                fprintf(stderr, "[QEMU-HOSTMEM-AUDIT] res_id=%u: non_zero=%zu/%zu (first=0x%08X)\n",
-                        resource_id, non_zero, pixel_count, first_pixel);
-                FILE *af = fopen("/tmp/aperture_2d_audit.txt", "w");
-                if (af) {
-                    fprintf(af, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
-                            resource_id, non_zero, pixel_count, first_pixel);
-                    fclose(af);
+                
+                size_t transfer_size = res->blob_size ? (size_t)res->blob_size
+                                                       : ((size_t)res->width * res->height * 4);
+                const uint8_t *pixel_src = NULL;
+                bool free_pixel_src = false;
+
+                if (res->iov && res->iov_cnt > 0 && transfer_size > 0) {
+                    /* Standard 2D resource path: pixel data lives in guest-RAM iovecs. */
+                    uint8_t *temp_buf = g_malloc0(transfer_size);
+                    if (res->remapped) {
+                        iov_to_buf(res->iov, res->iov_cnt, 0, res->remapped, transfer_size);
+                    }
+                    iov_to_buf(res->iov, res->iov_cnt, 0, temp_buf, transfer_size);
+                    pixel_src = temp_buf;
+                    free_pixel_src = true;
+                    fprintf(stderr, "[QEMU-HOSTMEM] res %u: reading via iov_to_buf (2D path)\n", resource_id);
+                } else if (res->remapped && transfer_size > 0) {
+                    /* hostmem_priv IOSurface path: remapped is locked IOSurface base address. */
+                    fprintf(stderr, "[QEMU-HOSTMEM] res %u: reading from res->remapped (hostmem path) %p\n",
+                            resource_id, res->remapped);
+                    uint8_t *temp_buf = g_malloc0(transfer_size);
+                    memcpy(temp_buf, res->remapped, transfer_size);
+                    pixel_src = temp_buf;
+                    free_pixel_src = true;
+                } else {
+                    /* Blob resource path: pixel data lives in virgl's map_fixed (vm_remap'd IOSurface). */
+                    size_t blob_sz = 0;
+                    void *blob_map = virtio_gpu_hostmem_get_blob_map(dev, resource_id, &blob_sz);
+                    if (blob_map && blob_sz > 0) {
+                        if (transfer_size == 0) {
+                            transfer_size = blob_sz;
+                        }
+                        fprintf(stderr, "[QEMU-HOSTMEM] res %u: reading from blob map_fixed %p size=%zu (blob path)\n",
+                                resource_id, blob_map, transfer_size);
+                        uint8_t *temp_buf = g_malloc0(transfer_size);
+                        memcpy(temp_buf, blob_map, transfer_size);
+                        pixel_src = temp_buf;
+                        free_pixel_src = true;
+                    } else {
+                        fprintf(stderr, "[QEMU-HOSTMEM] res %u: no pixel data — remapped=%p, iov=%p, blob_map=%p\n",
+                                resource_id, res->remapped, res->iov, blob_map);
+                    }
                 }
-                FILE *wf = fopen("/Users/skanda/Documents/Coding Projects/Aperture/virglrender/build/2d_audit.txt", "w");
-                if (wf) {
-                    fprintf(wf, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
+
+                if (pixel_src && transfer_size > 0) {
+                    uint32_t *pixels = (uint32_t *)pixel_src;
+                    size_t pixel_count = transfer_size / 4;
+                    size_t non_zero = 0;
+                    uint32_t first_pixel = 0;
+                    for (size_t i = 0; i < pixel_count; i++) {
+                        if (pixels[i] != 0) {
+                            non_zero++;
+                            if (first_pixel == 0) first_pixel = pixels[i];
+                        }
+                    }
+                    fprintf(stderr, "[QEMU-HOSTMEM-AUDIT] res_id=%u: non_zero=%zu/%zu (first=0x%08X)\n",
                             resource_id, non_zero, pixel_count, first_pixel);
-                    fclose(wf);
+
+                    FILE *rf = fopen("/tmp/aperture_display_2.raw", "wb");
+                    if (rf) {
+                        fwrite(pixel_src, 1, transfer_size, rf);
+                        fclose(rf);
+                    }
+                    FILE *prf = fopen("/private/tmp/aperture_display_2.raw", "wb");
+                    if (prf) {
+                        fwrite(pixel_src, 1, transfer_size, prf);
+                        fclose(prf);
+                    }
+
+                    FILE *af = fopen("/tmp/aperture_2d_audit.txt", "w");
+                    if (af) {
+                        fprintf(af, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
+                                resource_id, non_zero, pixel_count, first_pixel);
+                        fclose(af);
+                    }
+                    FILE *paf = fopen("/private/tmp/aperture_2d_audit.txt", "w");
+                    if (paf) {
+                        fprintf(paf, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
+                                resource_id, non_zero, pixel_count, first_pixel);
+                        fclose(paf);
+                    }
+                    FILE *wf = fopen("/Users/skanda/Documents/Coding Projects/Aperture/virglrender/build/2d_audit.txt", "w");
+                    if (wf) {
+                        fprintf(wf, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
+                                resource_id, non_zero, pixel_count, first_pixel);
+                        fclose(wf);
+                    }
+                    if (free_pixel_src) { g_free((void *)pixel_src); }
                 }
             } else {
+                fprintf(stderr, "[QEMU-HOSTMEM] res %u NOT FOUND in dev %p!\n", resource_id, dev);
                 qemu_log_mask(LOG_GUEST_ERROR,
-                              "[QEMU-HostMem] Transfer requested for missing or unmapped res_id=%u (ignoring safely)\n",
+                              "[QEMU-HostMem] Transfer requested for missing res_id=%u (ignoring safely)\n",
                               resource_id);
             }
         }
@@ -139,7 +339,7 @@ static void gpu_sock_read_cb(void *opaque)
             ssize_t s = send(s_gpu_sock_fd, ack + sent, sizeof(ack) - sent, MSG_DONTWAIT);
             if (s <= 0) {
                 if (s < 0 && (errno == EPIPE || errno == ECONNRESET)) {
-                    gpu_sock_disconnect();
+                    gpu_sock_disconnect("send error on ACK (EPIPE/ECONNRESET)");
                 }
                 break;
             }
@@ -172,8 +372,13 @@ static int gpu_sock_ensure_connected(void)
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         int err1 = errno;
+        close(fd);
         /* Try /private/tmp variant if sock_path starts with /tmp */
         if (strncmp(sock_path, "/tmp/", 5) == 0) {
+            fd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (fd < 0) {
+                return -1;
+            }
             char priv_path[256];
             snprintf(priv_path, sizeof(priv_path), "/private%s", sock_path);
             strncpy(addr.sun_path, priv_path, sizeof(addr.sun_path) - 1);
@@ -186,7 +391,6 @@ static int gpu_sock_ensure_connected(void)
         } else {
             fprintf(stderr, "[QEMU-HOSTMEM-SOCK] connect failed for %s: errno=%d (%s)\n",
                     sock_path, err1, strerror(err1));
-            close(fd);
             return -1;
         }
     }
@@ -209,7 +413,7 @@ static void gpu_sock_send(const uint8_t *buf, size_t len)
         ssize_t n = send(fd, buf + sent, len - sent, MSG_DONTWAIT);
         if (n <= 0) {
             if (n < 0 && (errno == EPIPE || errno == ECONNRESET)) {
-                gpu_sock_disconnect();
+                gpu_sock_disconnect("send error on notify (EPIPE/ECONNRESET)");
             }
             break;
         }
@@ -237,17 +441,30 @@ void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_
         fclose(wf);
     }
 
-    uint8_t buf[9];
-    buf[0] = 0x01;
-    buf[1] = (resource_id  >> 24) & 0xFF;
-    buf[2] = (resource_id  >> 16) & 0xFF;
-    buf[3] = (resource_id  >>  8) & 0xFF;
-    buf[4] = (resource_id       ) & 0xFF;
-    buf[5] = (iosurface_id >> 24) & 0xFF;
-    buf[6] = (iosurface_id >> 16) & 0xFF;
-    buf[7] = (iosurface_id >>  8) & 0xFF;
-    buf[8] = (iosurface_id      ) & 0xFF;
-    gpu_sock_send(buf, sizeof(buf));
+    /*
+     * VKR-thread-safe path: enqueue into the ring buffer and schedule the BH.
+     * The BH runs on the QEMU I/O thread, where it is safe to call
+     * gpu_sock_ensure_connected() and qemu_set_fd_handler().
+     */
+    uint32_t head = atomic_load_explicit(&s_notify_head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&s_notify_tail, memory_order_acquire);
+    if (((head + 1) & (NOTIFY_RING_SIZE - 1)) != (tail & (NOTIFY_RING_SIZE - 1))) {
+        /* Ring not full — write entry */
+        uint32_t idx = head & (NOTIFY_RING_SIZE - 1);
+        s_notify_ring[idx].resource_id  = resource_id;
+        s_notify_ring[idx].iosurface_id = iosurface_id;
+        atomic_store_explicit(&s_notify_head, head + 1, memory_order_release);
+    } else {
+        fprintf(stderr, "[QEMU-HOSTMEM-NOTIFY-CREATED] ring full, dropping notify for res_id=%u!\n", resource_id);
+    }
+
+    /* Schedule BH (safe to call from any thread) to drain the ring on the I/O thread. */
+    if (s_notify_bh) {
+        qemu_bh_schedule(s_notify_bh);
+    } else {
+        /* BH not yet created (device_realize not called yet) — fall back to timer. */
+        gpu_sock_schedule_reconnect();
+    }
 }
 
 __attribute__((visibility("default")))
@@ -354,6 +571,20 @@ static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_
     }
     s_gpu_device = g;
 
+    /* One-time I/O-thread initialization of the BH and reconnect timer.
+     * This function runs on the QEMU I/O thread so it is safe here. */
+    if (!s_notify_bh) {
+        s_notify_bh = qemu_bh_new(gpu_notify_bh_handler, NULL);
+        fprintf(stderr, "[QEMU-HOSTMEM] BH created, starting initial connection attempt\n");
+    }
+    if (!s_gpu_sock_timer) {
+        s_gpu_sock_timer = timer_new_ms(QEMU_CLOCK_REALTIME, gpu_sock_timer_cb, NULL);
+    }
+    /* Kick first connect attempt immediately via BH (I/O thread, next iteration). */
+    if (s_gpu_sock_fd < 0 && s_notify_bh) {
+        qemu_bh_schedule(s_notify_bh);
+    }
+
     size_t page_size = getpagesize();
 
     /* Bounds, sanity, and overflow check for allocation size */
@@ -443,6 +674,8 @@ static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_
     CFNumberRef bpr_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bpr);
     CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bpr_num);
     CFRelease(bpr_num);
+
+    CFDictionarySetValue(props, CFSTR("IOSurfaceIsGlobal"), kCFBooleanTrue);
 
     IOSurfaceRef surface = IOSurfaceCreate(props);
     CFRelease(props);
