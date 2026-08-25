@@ -736,6 +736,12 @@ static void virgl_cmd_transfer_to_host_2d(VirtIOGPU *g,
                         t2d.resource_id, non_zero, pixel_count, first_pixel);
                 fclose(wf);
             }
+            FILE *diff_f = fopen("/Users/skanda/Documents/Coding Projects/Aperture/Desktop/Research/ZeroCopy/TRACK_B_DIFFERENTIAL_AUDIT.txt", "a");
+            if (diff_f) {
+                fprintf(diff_f, "TIMESTAMP=%ld | GUEST_2D_XFER(res=%u): non_zero=%zu/%zu (first=0x%08X)\n",
+                        time(NULL), t2d.resource_id, non_zero, pixel_count, first_pixel);
+                fclose(diff_f);
+            }
         }
     }
 

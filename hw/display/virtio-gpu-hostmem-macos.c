@@ -218,6 +218,64 @@ static void gpu_sock_read_cb(void *opaque)
         if (g || s_gpu_device) {
             VirtIOGPU *dev = g ? g : s_gpu_device;
             struct virtio_gpu_simple_resource *res = virtio_gpu_find_resource(dev, resource_id);
+            
+            /* ========================================================================= */
+            /* DIFFERENTIAL AUDIT: Display 0 (Scanout) vs VirtualDisplay 2 (Requested)   */
+            /* ========================================================================= */
+            uint32_t disp0_res_id = dev->parent_obj.scanout[0].resource_id;
+            struct virtio_gpu_simple_resource *disp0_res = virtio_gpu_find_resource(dev, disp0_res_id);
+            
+            size_t disp0_non_zero = 0, disp0_total = 0;
+            uint32_t disp0_first = 0;
+            if (disp0_res && disp0_res->iov && disp0_res->iov_cnt > 0) {
+                size_t sz = disp0_res->blob_size ? (size_t)disp0_res->blob_size : ((size_t)disp0_res->width * disp0_res->height * 4);
+                if (sz > 0) {
+                    disp0_total = sz / 4;
+                    uint32_t *d0_buf = g_malloc0(sz);
+                    iov_to_buf(disp0_res->iov, disp0_res->iov_cnt, 0, d0_buf, sz);
+                    for (size_t i = 0; i < disp0_total; i++) {
+                        if (d0_buf[i] != 0) {
+                            disp0_non_zero++;
+                            if (disp0_first == 0) disp0_first = d0_buf[i];
+                        }
+                    }
+                    g_free(d0_buf);
+                }
+            }
+
+            size_t vd2_non_zero = 0, vd2_total = 0;
+            uint32_t vd2_first = 0;
+            if (res && res->iov && res->iov_cnt > 0) {
+                size_t sz = res->blob_size ? (size_t)res->blob_size : ((size_t)res->width * res->height * 4);
+                if (sz > 0) {
+                    vd2_total = sz / 4;
+                    uint32_t *vd2_buf = g_malloc0(sz);
+                    iov_to_buf(res->iov, res->iov_cnt, 0, vd2_buf, sz);
+                    for (size_t i = 0; i < vd2_total; i++) {
+                        if (vd2_buf[i] != 0) {
+                            vd2_non_zero++;
+                            if (vd2_first == 0) vd2_first = vd2_buf[i];
+                        }
+                    }
+                    g_free(vd2_buf);
+                }
+            }
+
+            fprintf(stderr, "\n[QEMU-DIFFERENTIAL-AUDIT] ====================================================\n");
+            fprintf(stderr, "[QEMU-DIFFERENTIAL-AUDIT] Display 0   (res_id=%u): non_zero=%zu/%zu (first=0x%08X)\n",
+                    disp0_res_id, disp0_non_zero, disp0_total, disp0_first);
+            fprintf(stderr, "[QEMU-DIFFERENTIAL-AUDIT] VirtualDisp2(res_id=%u): non_zero=%zu/%zu (first=0x%08X)\n",
+                    resource_id, vd2_non_zero, vd2_total, vd2_first);
+            fprintf(stderr, "[QEMU-DIFFERENTIAL-AUDIT] ====================================================\n\n");
+
+            FILE *diff_f = fopen("/Users/skanda/Documents/Coding Projects/Aperture/Desktop/Research/ZeroCopy/TRACK_B_DIFFERENTIAL_AUDIT.txt", "a");
+            if (diff_f) {
+                fprintf(diff_f, "TIMESTAMP=%ld | Display0(res=%u): non_zero=%zu/%zu (first=0x%08X) | VD2(res=%u): non_zero=%zu/%zu (first=0x%08X)\n",
+                        time(NULL), disp0_res_id, disp0_non_zero, disp0_total, disp0_first,
+                        resource_id, vd2_non_zero, vd2_total, vd2_first);
+                fclose(diff_f);
+            }
+            
             if (res) {
                 fprintf(stderr, "[QEMU-HOSTMEM] res %u found: blob_size=%" PRIu64 ", w=%u, h=%u, remapped=%p, iov=%p, iov_cnt=%u\n",
                         resource_id, res->blob_size, res->width, res->height, res->remapped, res->iov, res->iov_cnt);
