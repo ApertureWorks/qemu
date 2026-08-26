@@ -1699,7 +1699,8 @@ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
         }
     }
 
-    if (virtio_gpu_drm_enabled(g->parent_obj.conf)) {
+    if (virtio_gpu_venus_enabled(g->parent_obj.conf) ||
+        virtio_gpu_drm_enabled(g->parent_obj.conf)) {
         virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_DRM,
                                    &capset_max_ver,
                                    &capset_max_size);
