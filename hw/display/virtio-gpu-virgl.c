@@ -593,6 +593,14 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
             continue;
         }
         virtio_gpu_rect_update(g, i, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+
+        struct virtio_gpu_simple_resource *res = virtio_gpu_find_resource(g, rf.resource_id);
+        if (res) {
+            uint32_t iosurf_id = virtio_gpu_hostmem_get_iosurface_id(res);
+            if (iosurf_id > 0) {
+                virtio_gpu_hostmem_notify_scanout_flush(i, iosurf_id, rf.r.width, rf.r.height);
+            }
+        }
     }
 }
 

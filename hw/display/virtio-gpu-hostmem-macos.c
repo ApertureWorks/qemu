@@ -422,6 +422,11 @@ static int gpu_sock_ensure_connected(void)
         return -1;
     }
 
+#ifdef SO_NOSIGPIPE
+    int optval = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
+#endif
+
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -429,7 +434,6 @@ static int gpu_sock_ensure_connected(void)
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        int err1 = errno;
         close(fd);
         /* Try /private/tmp variant if sock_path starts with /tmp */
         if (strncmp(sock_path, "/tmp/", 5) == 0) {
@@ -437,18 +441,18 @@ static int gpu_sock_ensure_connected(void)
             if (fd < 0) {
                 return -1;
             }
+#ifdef SO_NOSIGPIPE
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval));
+#endif
             char priv_path[256];
             snprintf(priv_path, sizeof(priv_path), "/private%s", sock_path);
             strncpy(addr.sun_path, priv_path, sizeof(addr.sun_path) - 1);
             if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-                fprintf(stderr, "[QEMU-HOSTMEM-SOCK] connect failed for %s (%s) and %s (%s)\n",
-                        sock_path, strerror(err1), priv_path, strerror(errno));
                 close(fd);
                 return -1;
             }
         } else {
-            fprintf(stderr, "[QEMU-HOSTMEM-SOCK] connect failed for %s: errno=%d (%s)\n",
-                    sock_path, err1, strerror(err1));
+            close(fd);
             return -1;
         }
     }
@@ -535,6 +539,34 @@ void virtio_gpu_hostmem_notify_destroyed(uint32_t resource_id)
     buf[3] = (resource_id >>  8) & 0xFF;
     buf[4] = (resource_id      ) & 0xFF;
     gpu_sock_send(buf, sizeof(buf));
+}
+
+__attribute__((visibility("default")))
+void virtio_gpu_hostmem_notify_scanout_flush(uint32_t scanout_id, uint32_t iosurface_id, uint32_t width, uint32_t height)
+{
+    uint8_t packet[17];
+    packet[0] = 0x05; // GPUScanoutFlushed Tag
+    packet[1]  = (scanout_id   >> 24) & 0xFF;
+    packet[2]  = (scanout_id   >> 16) & 0xFF;
+    packet[3]  = (scanout_id   >>  8) & 0xFF;
+    packet[4]  = (scanout_id        ) & 0xFF;
+
+    packet[5]  = (iosurface_id >> 24) & 0xFF;
+    packet[6]  = (iosurface_id >> 16) & 0xFF;
+    packet[7]  = (iosurface_id >>  8) & 0xFF;
+    packet[8]  = (iosurface_id      ) & 0xFF;
+
+    packet[9]  = (width        >> 24) & 0xFF;
+    packet[10] = (width        >> 16) & 0xFF;
+    packet[11] = (width        >>  8) & 0xFF;
+    packet[12] = (width             ) & 0xFF;
+
+    packet[13] = (height       >> 24) & 0xFF;
+    packet[14] = (height       >> 16) & 0xFF;
+    packet[15] = (height       >>  8) & 0xFF;
+    packet[16] = (height            ) & 0xFF;
+
+    gpu_sock_send(packet, sizeof(packet));
 }
 
 struct VirtIOGPUMacOSHostMem {
