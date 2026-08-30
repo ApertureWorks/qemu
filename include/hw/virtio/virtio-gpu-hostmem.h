@@ -35,6 +35,8 @@ void virtio_gpu_hostmem_notify_scanout_flush(uint32_t scanout_id, uint32_t iosur
 
 void *virtio_gpu_hostmem_get_iosurface(struct virtio_gpu_simple_resource *res);
 uint32_t virtio_gpu_hostmem_get_iosurface_id(struct virtio_gpu_simple_resource *res);
+uint32_t virtio_gpu_hostmem_lookup_iosurface_id(uint32_t res_id);
+void *virtio_gpu_hostmem_lookup_iosurface_base(uint32_t res_id);
 
 /* Returns the vm_remap'd host VA for a virgl blob resource (blob path),
  * or NULL if the resource is not a mapped blob. blob_size_out may be NULL. */

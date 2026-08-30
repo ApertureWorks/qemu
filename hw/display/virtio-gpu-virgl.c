@@ -244,6 +244,13 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
     }
 
 #ifdef __APPLE__
+    void *surf_base = virtio_gpu_hostmem_lookup_iosurface_base(res->base.resource_id);
+    if (surf_base) {
+        data = surf_base;
+        fprintf(stderr, "[VIRGL-MAP-IOSURFACE-DIRECT] ✅ res_id=%u mapped directly to IOSurface base=%p\n",
+                res->base.resource_id, data);
+    }
+
     if (gl->hostmem_mmap) {
         vm_address_t target = (vm_address_t)(gl->hostmem_mmap + offset);
         vm_prot_t cur_prot, max_prot;

@@ -68,5 +68,15 @@ uint32_t virtio_gpu_hostmem_get_iosurface_id(struct virtio_gpu_simple_resource *
 {
     return 0;
 }
+
+uint32_t virtio_gpu_hostmem_lookup_iosurface_id(uint32_t res_id)
+{
+    return 0;
+}
+
+void *virtio_gpu_hostmem_lookup_iosurface_base(uint32_t res_id)
+{
+    return NULL;
+}
 #endif
 

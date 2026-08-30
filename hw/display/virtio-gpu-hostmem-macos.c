@@ -64,6 +64,39 @@ static _Atomic uint32_t s_notify_head = 0;  /* written by VKR threads */
 static _Atomic uint32_t s_notify_tail = 0;  /* read/drained by I/O thread */
 static QEMUBH *s_notify_bh = NULL;           /* scheduled by VKR threads, runs on I/O thread */
 
+struct VirtIOGPUMacOSHostMem {
+    IOSurfaceRef surface;
+    uint32_t iosurface_id;
+};
+
+static void audit_hostmem_surface(IOSurfaceRef surface, uint32_t res_id, uint32_t iosurf_id) {
+    if (!surface) return;
+    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    uint32_t *base = (uint32_t *)IOSurfaceGetBaseAddress(surface);
+    size_t alloc_size = IOSurfaceGetAllocSize(surface);
+    size_t count = alloc_size / 4;
+    size_t non_zero = 0;
+    size_t orange = 0;
+    if (base && count > 0) {
+        for (size_t i = 0; i < count; i++) {
+            if (base[i] != 0) non_zero++;
+            if (base[i] == 0xFFFF8000) orange++;
+        }
+    }
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    if (non_zero > 0) {
+        fprintf(stderr, "[QEMU-INTERNAL-PIXEL-AUDIT] res_id=%u iosurf_id=%u: non_zero=%zu/%zu (%.2f%%), orange=%zu\n",
+                res_id, iosurf_id, non_zero, count, (double)non_zero * 100.0 / (double)count, orange);
+        
+        FILE *f = fopen("/tmp/aperture_qemu_pixel_audit.txt", "a");
+        if (f) {
+            fprintf(f, "res_id=%u iosurf_id=%u non_zero=%zu total=%zu orange=%zu (%.2f%%)\n",
+                    res_id, iosurf_id, non_zero, count, orange, (double)non_zero * 100.0 / (double)count);
+            fclose(f);
+        }
+    }
+}
+
 static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_resource *res);
 static int gpu_sock_ensure_connected(void);
 
@@ -99,6 +132,22 @@ static void gpu_sock_timer_cb(void *opaque)
             tail++;
             atomic_store_explicit(&s_notify_tail, tail, memory_order_release);
         }
+    }
+
+    /* Audit all active hostmem IOSurfaces */
+    if (s_gpu_device) {
+        struct virtio_gpu_simple_resource *res;
+        QTAILQ_FOREACH(res, &s_gpu_device->reslist, next) {
+            if (res->hostmem_priv) {
+                struct VirtIOGPUMacOSHostMem *hm = (struct VirtIOGPUMacOSHostMem *)res->hostmem_priv;
+                audit_hostmem_surface(hm->surface, res->resource_id, hm->iosurface_id);
+            }
+        }
+    }
+
+    /* Re-arm periodic audit timer every 500ms */
+    if (s_gpu_sock_timer) {
+        timer_mod(s_gpu_sock_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 500);
     }
 }
 
@@ -483,10 +532,36 @@ static void gpu_sock_send(const uint8_t *buf, size_t len)
     }
 }
 
+static _Atomic uint32_t s_res_to_iosurf[8192];
+
+uint32_t virtio_gpu_hostmem_lookup_iosurface_id(uint32_t res_id)
+{
+    if (res_id < 8192) {
+        return atomic_load_explicit(&s_res_to_iosurf[res_id], memory_order_acquire);
+    }
+    return 0;
+}
+
+void *virtio_gpu_hostmem_lookup_iosurface_base(uint32_t res_id)
+{
+    uint32_t iosurf_id = virtio_gpu_hostmem_lookup_iosurface_id(res_id);
+    if (iosurf_id > 0) {
+        IOSurfaceRef surf = IOSurfaceLookup(iosurf_id);
+        if (surf) {
+            IOSurfaceLock(surf, 0, NULL);
+            return IOSurfaceGetBaseAddress(surf);
+        }
+    }
+    return NULL;
+}
+
 __attribute__((visibility("default")))
 void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_id)
 {
     fprintf(stderr, "[QEMU-HOSTMEM-NOTIFY-CREATED] res_id=%u, iosurf_id=%u\n", resource_id, iosurface_id);
+    if (resource_id < 8192) {
+        atomic_store_explicit(&s_res_to_iosurf[resource_id], iosurface_id, memory_order_release);
+    }
     FILE *f = fopen("/tmp/aperture_latest_2d_iosurface.txt", "w");
     if (f) {
         fprintf(f, "%u %u\n", resource_id, iosurface_id);
@@ -532,6 +607,9 @@ void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_
 __attribute__((visibility("default")))
 void virtio_gpu_hostmem_notify_destroyed(uint32_t resource_id)
 {
+    if (resource_id < 8192) {
+        atomic_store_explicit(&s_res_to_iosurf[resource_id], 0, memory_order_release);
+    }
     uint8_t buf[5];
     buf[0] = 0x02;
     buf[1] = (resource_id >> 24) & 0xFF;
@@ -568,11 +646,6 @@ void virtio_gpu_hostmem_notify_scanout_flush(uint32_t scanout_id, uint32_t iosur
 
     gpu_sock_send(packet, sizeof(packet));
 }
-
-struct VirtIOGPUMacOSHostMem {
-    IOSurfaceRef surface;
-    uint32_t iosurface_id;
-};
 
 void *virtio_gpu_hostmem_get_iosurface(struct virtio_gpu_simple_resource *res)
 {
@@ -622,8 +695,8 @@ static int macos_hostmem_map_resource(VirtIOGPU *g, struct virtio_gpu_simple_res
     }
 
     void *addr = IOSurfaceGetBaseAddress(hm->surface);
+    IOSurfaceUnlock(hm->surface, 0, NULL);
     if (!addr) {
-        IOSurfaceUnlock(hm->surface, 0, NULL);
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: IOSurfaceGetBaseAddress returned NULL for res_id=%u\n",
                       __func__, res->resource_id);
@@ -641,14 +714,7 @@ static void macos_hostmem_unmap_resource(VirtIOGPU *g, struct virtio_gpu_simple_
         return;
     }
 
-    struct VirtIOGPUMacOSHostMem *hm = (struct VirtIOGPUMacOSHostMem *)res->hostmem_priv;
-    if (res->remapped && hm->surface) {
-        kern_return_t kr = IOSurfaceUnlock(hm->surface, 0, NULL);
-        if (kr != kIOReturnSuccess) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "%s: IOSurfaceUnlock failed for res_id=%u (kr=0x%x)\n",
-                          __func__, res->resource_id, kr);
-        }
+    if (res->remapped) {
         res->remapped = NULL;
         res->blob = NULL;
     }
@@ -814,13 +880,8 @@ static void macos_hostmem_destroy_resource(VirtIOGPU *g, struct virtio_gpu_simpl
     res->hostmem_priv = NULL;
 
     if (hm->surface) {
+        audit_hostmem_surface(hm->surface, res->resource_id, hm->iosurface_id);
         if (res->remapped) {
-            kern_return_t kr = IOSurfaceUnlock(hm->surface, 0, NULL);
-            if (kr != kIOReturnSuccess) {
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "%s: IOSurfaceUnlock failed for res_id=%u (kr=0x%x)\n",
-                              __func__, res->resource_id, kr);
-            }
             res->remapped = NULL;
             res->blob = NULL;
         }
