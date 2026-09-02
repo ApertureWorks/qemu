@@ -582,7 +582,9 @@ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
         return;
     }
 
-    qemu_console_gl_update(g->parent_obj.scanout[idx].con, x, y, width, height);
+    if (qemu_console_has_gl(g->parent_obj.scanout[idx].con)) {
+        qemu_console_gl_update(g->parent_obj.scanout[idx].con, x, y, width, height);
+    }
 }
 
 static void virgl_cmd_resource_flush(VirtIOGPU *g,
@@ -601,12 +603,18 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
         }
         virtio_gpu_rect_update(g, i, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
 
+        uint32_t iosurf_id = 0;
         struct virtio_gpu_simple_resource *res = virtio_gpu_find_resource(g, rf.resource_id);
         if (res) {
-            uint32_t iosurf_id = virtio_gpu_hostmem_get_iosurface_id(res);
-            if (iosurf_id > 0) {
-                virtio_gpu_hostmem_notify_scanout_flush(i, iosurf_id, rf.r.width, rf.r.height);
-            }
+            iosurf_id = virtio_gpu_hostmem_get_iosurface_id(res);
+        }
+        if (iosurf_id == 0) {
+            iosurf_id = virtio_gpu_hostmem_lookup_iosurface_id(rf.resource_id);
+        }
+        if (iosurf_id > 0) {
+            fprintf(stderr, "[VIRGL-SCANOUT-FLUSH] scanout=%d res_id=%u iosurf_id=%u (%ux%u)\n",
+                    i, rf.resource_id, iosurf_id, rf.r.width, rf.r.height);
+            virtio_gpu_hostmem_notify_scanout_flush(i, iosurf_id, rf.r.width, rf.r.height);
         }
     }
 }
@@ -644,22 +652,29 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         ret = virgl_renderer_resource_get_info(ss.resource_id, &info);
 #endif
         if (ret) {
+            fprintf(stderr, "[VIRGL-SET-SCANOUT-REJECTED] scanout_id=%u res_id=%u ret=%d\n",
+                    ss.scanout_id, ss.resource_id, ret);
             qemu_log_mask(LOG_GUEST_ERROR,
                           "%s: illegal resource specified %d\n",
                           __func__, ss.resource_id);
             cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
             return;
         }
+        fprintf(stderr, "[VIRGL-SET-SCANOUT-ACCEPTED] scanout_id=%u res_id=%u rect=%ux%u+%u+%u tex_id=%u\n",
+                ss.scanout_id, ss.resource_id, ss.r.width, ss.r.height, ss.r.x, ss.r.y, info.tex_id);
         qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
                             ss.r.width, ss.r.height);
-        virgl_renderer_force_ctx_0();
-        qemu_console_gl_scanout_texture(
-            g->parent_obj.scanout[ss.scanout_id].con, info.tex_id,
-            info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
-            info.width, info.height,
-            ss.r.x, ss.r.y, ss.r.width, ss.r.height,
-            d3d_tex2d);
+        if (info.tex_id > 0) {
+            virgl_renderer_force_ctx_0();
+            qemu_console_gl_scanout_texture(
+                g->parent_obj.scanout[ss.scanout_id].con, info.tex_id,
+                info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
+                info.width, info.height,
+                ss.r.x, ss.r.y, ss.r.width, ss.r.height,
+                d3d_tex2d);
+        }
     } else {
+        fprintf(stderr, "[VIRGL-SET-SCANOUT-DISABLED] scanout_id=%u\n", ss.scanout_id);
         qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
         qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
     }
