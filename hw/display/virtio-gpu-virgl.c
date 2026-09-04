@@ -393,6 +393,7 @@ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
     res->base.format = c2d.format;
     res->base.resource_id = c2d.resource_id;
     res->base.dmabuf_fd = -1;
+    res->base.blob_size = (uint64_t)c2d.width * c2d.height * 4;
     QTAILQ_INSERT_HEAD(&g->reslist, &res->base, next);
 
     args.handle = c2d.resource_id;
@@ -476,6 +477,8 @@ virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
     }
 #endif
 
+    res->base.iov = NULL;
+    res->base.iov_cnt = 0;
     virgl_renderer_resource_detach_iov(res->base.resource_id,
                                        &res_iovs,
                                        &num_iovs);
@@ -487,7 +490,7 @@ virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
 #if defined(CONFIG_DARWIN) || defined(__APPLE__)
     if (res->base.hostmem_priv) {
         virtio_gpu_hostmem_destroy_resource(g, &res->base);
-    } else if (res->base.dmabuf_fd > 0) {
+    } else {
         virtio_gpu_hostmem_notify_destroyed(res->base.resource_id);
     }
 #endif
@@ -612,9 +615,16 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
             iosurf_id = virtio_gpu_hostmem_lookup_iosurface_id(rf.resource_id);
         }
         if (iosurf_id > 0) {
+            virtio_gpu_hostmem_sync_scanout(rf.resource_id, res);
+
+            uint32_t flush_w = rf.r.width ? rf.r.width : g->parent_obj.scanout[i].width;
+            uint32_t flush_h = rf.r.height ? rf.r.height : g->parent_obj.scanout[i].height;
+            if (flush_w == 0 && res) flush_w = res->width;
+            if (flush_h == 0 && res) flush_h = res->height;
+
             fprintf(stderr, "[VIRGL-SCANOUT-FLUSH] scanout=%d res_id=%u iosurf_id=%u (%ux%u)\n",
-                    i, rf.resource_id, iosurf_id, rf.r.width, rf.r.height);
-            virtio_gpu_hostmem_notify_scanout_flush(i, iosurf_id, rf.r.width, rf.r.height);
+                    i, rf.resource_id, iosurf_id, flush_w, flush_h);
+            virtio_gpu_hostmem_notify_scanout_flush(i, iosurf_id, flush_w, flush_h);
         }
     }
 }
@@ -660,8 +670,14 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
             cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
             return;
         }
-        fprintf(stderr, "[VIRGL-SET-SCANOUT-ACCEPTED] scanout_id=%u res_id=%u rect=%ux%u+%u+%u tex_id=%u\n",
-                ss.scanout_id, ss.resource_id, ss.r.width, ss.r.height, ss.r.x, ss.r.y, info.tex_id);
+
+        uint32_t iosurf_id = virtio_gpu_hostmem_lookup_iosurface_id(ss.resource_id);
+        if (iosurf_id == 0) {
+            iosurf_id = virtio_gpu_hostmem_create_scanout_iosurface(g, ss.resource_id, ss.r.width, ss.r.height);
+        }
+
+        fprintf(stderr, "[VIRGL-SET-SCANOUT-ACCEPTED] scanout_id=%u res_id=%u iosurf_id=%u rect=%ux%u+%u+%u tex_id=%u\n",
+                ss.scanout_id, ss.resource_id, iosurf_id, ss.r.width, ss.r.height, ss.r.x, ss.r.y, info.tex_id);
         qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
                             ss.r.width, ss.r.height);
         if (info.tex_id > 0) {
@@ -848,8 +864,17 @@ static void virgl_resource_attach_backing(VirtIOGPU *g,
     ret = virgl_renderer_resource_attach_iov(att_rb.resource_id,
                                              res_iovs, res_niov);
 
-    if (ret != 0)
+    if (ret != 0) {
         virtio_gpu_cleanup_mapping_iov(g, res_iovs, res_niov);
+        return;
+    }
+
+    struct virtio_gpu_virgl_resource *res = virtio_gpu_virgl_find_resource(g, att_rb.resource_id);
+    if (res) {
+        res->base.iov = res_iovs;
+        res->base.iov_cnt = res_niov;
+    }
+    fprintf(stderr, "[VIRGL-ATTACH-BACKING] res_id=%u niov=%u\n", att_rb.resource_id, res_niov);
 }
 
 static void virgl_resource_detach_backing(VirtIOGPU *g,
@@ -861,6 +886,12 @@ static void virgl_resource_detach_backing(VirtIOGPU *g,
 
     VIRTIO_GPU_FILL_CMD(detach_rb);
     trace_virtio_gpu_cmd_res_back_detach(detach_rb.resource_id);
+
+    struct virtio_gpu_virgl_resource *res = virtio_gpu_virgl_find_resource(g, detach_rb.resource_id);
+    if (res) {
+        res->base.iov = NULL;
+        res->base.iov_cnt = 0;
+    }
 
     virgl_renderer_resource_detach_iov(detach_rb.resource_id,
                                        &res_iovs,
@@ -1151,6 +1182,8 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
         return;
     }
+
+#ifndef __APPLE__
     if (res->base.dmabuf_fd < 0) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource not backed by dmabuf %d\n",
                       __func__, ss.resource_id);
@@ -1172,6 +1205,29 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
     }
 
     virtio_gpu_update_scanout(g, ss.scanout_id, &res->base, &fb, &ss.r);
+#else
+    uint32_t iosurf_id = virtio_gpu_hostmem_lookup_iosurface_id(ss.resource_id);
+    if (iosurf_id == 0) {
+        iosurf_id = virtio_gpu_hostmem_get_iosurface_id(&res->base);
+    }
+    if (iosurf_id == 0) {
+        iosurf_id = virtio_gpu_hostmem_create_scanout_iosurface(g, ss.resource_id, ss.r.width, ss.r.height);
+    }
+
+    fprintf(stderr, "[VIRGL-SET-SCANOUT-BLOB-ACCEPTED] scanout_id=%u res_id=%u iosurf_id=%u rect=%ux%u+%u+%u\n",
+            ss.scanout_id, ss.resource_id, iosurf_id, ss.r.width, ss.r.height, ss.r.x, ss.r.y);
+    g->parent_obj.enable = 1;
+    g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
+    g->parent_obj.scanout[ss.scanout_id].width = ss.r.width;
+    g->parent_obj.scanout[ss.scanout_id].height = ss.r.height;
+    g->parent_obj.scanout[ss.scanout_id].x = ss.r.x;
+    g->parent_obj.scanout[ss.scanout_id].y = ss.r.y;
+
+    if (iosurf_id > 0) {
+        virtio_gpu_hostmem_sync_scanout(ss.resource_id, &res->base);
+        virtio_gpu_hostmem_notify_scanout_flush(ss.scanout_id, iosurf_id, ss.r.width, ss.r.height);
+    }
+#endif
 }
 #endif
 

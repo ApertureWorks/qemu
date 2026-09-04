@@ -533,6 +533,7 @@ static void gpu_sock_send(const uint8_t *buf, size_t len)
 }
 
 static _Atomic uint32_t s_res_to_iosurf[8192];
+static IOSurfaceRef s_scanout_iosurfaces[8192];
 
 uint32_t virtio_gpu_hostmem_lookup_iosurface_id(uint32_t res_id)
 {
@@ -544,12 +545,18 @@ uint32_t virtio_gpu_hostmem_lookup_iosurface_id(uint32_t res_id)
 
 void *virtio_gpu_hostmem_lookup_iosurface_base(uint32_t res_id)
 {
+    if (res_id < 8192 && s_scanout_iosurfaces[res_id]) {
+        return IOSurfaceGetBaseAddress(s_scanout_iosurfaces[res_id]);
+    }
     uint32_t iosurf_id = virtio_gpu_hostmem_lookup_iosurface_id(res_id);
     if (iosurf_id > 0) {
         IOSurfaceRef surf = IOSurfaceLookup(iosurf_id);
         if (surf) {
             IOSurfaceLock(surf, 0, NULL);
-            return IOSurfaceGetBaseAddress(surf);
+            void *addr = IOSurfaceGetBaseAddress(surf);
+            IOSurfaceUnlock(surf, 0, NULL);
+            CFRelease(surf);
+            return addr;
         }
     }
     return NULL;
@@ -609,6 +616,10 @@ void virtio_gpu_hostmem_notify_destroyed(uint32_t resource_id)
 {
     if (resource_id < 8192) {
         atomic_store_explicit(&s_res_to_iosurf[resource_id], 0, memory_order_release);
+        if (s_scanout_iosurfaces[resource_id]) {
+            CFRelease(s_scanout_iosurfaces[resource_id]);
+            s_scanout_iosurfaces[resource_id] = NULL;
+        }
     }
     uint8_t buf[5];
     buf[0] = 0x02;
@@ -717,6 +728,147 @@ static void macos_hostmem_unmap_resource(VirtIOGPU *g, struct virtio_gpu_simple_
     if (res->remapped) {
         res->remapped = NULL;
         res->blob = NULL;
+    }
+}
+
+uint32_t virtio_gpu_hostmem_create_scanout_iosurface(VirtIOGPU *g, uint32_t res_id, uint32_t width, uint32_t height)
+{
+    if (res_id >= 8192 || width == 0 || height == 0) {
+        return 0;
+    }
+
+    uint32_t existing_id = virtio_gpu_hostmem_lookup_iosurface_id(res_id);
+    if (existing_id > 0) {
+        return existing_id;
+    }
+
+    CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    if (!props) {
+        return 0;
+    }
+
+    size_t size = (size_t)width * height * 4;
+    CFNumberRef bytes_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &size);
+    CFDictionarySetValue(props, kIOSurfaceAllocSize, bytes_num);
+    CFRelease(bytes_num);
+
+    CFDictionarySetValue(props, CFSTR("IOSurfaceIsGlobal"), kCFBooleanTrue);
+
+    int bpe = 4;
+    CFNumberRef bpe_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bpe);
+    CFDictionarySetValue(props, kIOSurfaceBytesPerElement, bpe_num);
+    CFRelease(bpe_num);
+
+    uint32_t pixel_format = 0x52474241; /* 'RGBA' */
+    CFNumberRef fmt_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixel_format);
+    CFDictionarySetValue(props, kIOSurfacePixelFormat, fmt_num);
+    CFRelease(fmt_num);
+
+    int w = (int)width;
+    CFNumberRef w_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &w);
+    CFDictionarySetValue(props, kIOSurfaceWidth, w_num);
+    CFRelease(w_num);
+
+    int h = (int)height;
+    CFNumberRef h_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &h);
+    CFDictionarySetValue(props, kIOSurfaceHeight, h_num);
+    CFRelease(h_num);
+
+    int bpr = (int)width * 4;
+    CFNumberRef bpr_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bpr);
+    CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bpr_num);
+    CFRelease(bpr_num);
+
+    IOSurfaceRef surface = IOSurfaceCreate(props);
+    CFRelease(props);
+
+    if (!surface) {
+        fprintf(stderr, "[QEMU-HOSTMEM] Failed to allocate scanout IOSurface for res_id=%u (%ux%u)\n",
+                res_id, width, height);
+        return 0;
+    }
+
+    uint32_t iosurf_id = IOSurfaceGetID(surface);
+    fprintf(stderr, "[QEMU-HOSTMEM-2D-SCANOUT] Allocated IOSurface ID %u for res_id=%u (%ux%u, size=%zu)\n",
+            iosurf_id, res_id, width, height, size);
+
+    if (s_scanout_iosurfaces[res_id]) {
+        CFRelease(s_scanout_iosurfaces[res_id]);
+    }
+    s_scanout_iosurfaces[res_id] = surface;
+
+    struct virtio_gpu_simple_resource *res = virtio_gpu_find_resource(g, res_id);
+    if (res) {
+        CFRetain(surface);
+        res->blob_size = size;
+        if (!res->hostmem_priv) {
+            struct VirtIOGPUMacOSHostMem *hm = g_new0(struct VirtIOGPUMacOSHostMem, 1);
+            hm->surface = surface;
+            hm->iosurface_id = iosurf_id;
+            res->hostmem_priv = hm;
+        } else {
+            struct VirtIOGPUMacOSHostMem *hm = (struct VirtIOGPUMacOSHostMem *)res->hostmem_priv;
+            if (hm->surface && hm->surface != surface) {
+                CFRelease(hm->surface);
+            }
+            hm->surface = surface;
+            hm->iosurface_id = iosurf_id;
+        }
+        macos_hostmem_map_resource(g, res);
+    }
+
+    virtio_gpu_hostmem_notify_created(res_id, iosurf_id);
+    return iosurf_id;
+}
+
+void virtio_gpu_hostmem_sync_scanout(uint32_t res_id, struct virtio_gpu_simple_resource *res)
+{
+    if (!res || !res->iov || res->iov_cnt == 0) {
+        return;
+    }
+    IOSurfaceRef surf = NULL;
+    bool need_release = false;
+    if (res_id < 8192 && s_scanout_iosurfaces[res_id]) {
+        surf = s_scanout_iosurfaces[res_id];
+    } else {
+        uint32_t iosurf_id = virtio_gpu_hostmem_lookup_iosurface_id(res_id);
+        if (iosurf_id > 0) {
+            surf = IOSurfaceLookup(iosurf_id);
+            need_release = true;
+        }
+    }
+    if (!surf) {
+        return;
+    }
+
+    IOSurfaceLock(surf, 0, NULL);
+    void *addr = IOSurfaceGetBaseAddress(surf);
+    size_t alloc_size = IOSurfaceGetAllocSize(surf);
+    if (addr && alloc_size > 0) {
+        size_t copy_size = (res->blob_size > 0 && res->blob_size <= alloc_size) ? res->blob_size : alloc_size;
+        iov_to_buf(res->iov, res->iov_cnt, 0, addr, copy_size);
+
+        uint32_t *pix = (uint32_t *)addr;
+        size_t npix = copy_size / 4;
+        size_t nz = 0;
+        uint32_t first = 0;
+        for (size_t p = 0; p < npix; p += 64) {
+            if (pix[p] != 0) {
+                nz++;
+                if (first == 0) first = pix[p];
+            }
+        }
+        if (nz > 0) {
+            fprintf(stderr, "[VIRGL-SCANOUT-SYNC-NZ] res_id=%u copy_size=%zu nz_samples=%zu first=0x%08X\n",
+                    res_id, copy_size, nz, first);
+        }
+    }
+    IOSurfaceUnlock(surf, 0, NULL);
+    if (need_release) {
+        CFRelease(surf);
     }
 }
 

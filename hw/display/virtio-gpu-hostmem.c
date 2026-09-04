@@ -78,5 +78,12 @@ void *virtio_gpu_hostmem_lookup_iosurface_base(uint32_t res_id)
 {
     return NULL;
 }
+
+uint32_t virtio_gpu_hostmem_create_scanout_iosurface(VirtIOGPU *g, uint32_t res_id, uint32_t width, uint32_t height)
+{
+    return 0;
+}
+
+void virtio_gpu_hostmem_sync_scanout(uint32_t res_id, struct virtio_gpu_simple_resource *res) {}
 #endif
 

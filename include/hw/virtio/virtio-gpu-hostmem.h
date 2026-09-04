@@ -37,6 +37,8 @@ void *virtio_gpu_hostmem_get_iosurface(struct virtio_gpu_simple_resource *res);
 uint32_t virtio_gpu_hostmem_get_iosurface_id(struct virtio_gpu_simple_resource *res);
 uint32_t virtio_gpu_hostmem_lookup_iosurface_id(uint32_t res_id);
 void *virtio_gpu_hostmem_lookup_iosurface_base(uint32_t res_id);
+uint32_t virtio_gpu_hostmem_create_scanout_iosurface(VirtIOGPU *g, uint32_t res_id, uint32_t width, uint32_t height);
+void virtio_gpu_hostmem_sync_scanout(uint32_t res_id, struct virtio_gpu_simple_resource *res);
 
 /* Returns the vm_remap'd host VA for a virgl blob resource (blob path),
  * or NULL if the resource is not a mapped blob. blob_size_out may be NULL. */
