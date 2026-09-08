@@ -622,8 +622,10 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
             if (flush_w == 0 && res) flush_w = res->width;
             if (flush_h == 0 && res) flush_h = res->height;
 
+#ifdef DEBUG_SCANOUT
             fprintf(stderr, "[VIRGL-SCANOUT-FLUSH] scanout=%d res_id=%u iosurf_id=%u (%ux%u)\n",
                     i, rf.resource_id, iosurf_id, flush_w, flush_h);
+#endif
             virtio_gpu_hostmem_notify_scanout_flush(i, iosurf_id, flush_w, flush_h);
         }
     }
@@ -676,8 +678,10 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
             iosurf_id = virtio_gpu_hostmem_create_scanout_iosurface(g, ss.resource_id, ss.r.width, ss.r.height);
         }
 
+#ifdef DEBUG_SCANOUT
         fprintf(stderr, "[VIRGL-SET-SCANOUT-ACCEPTED] scanout_id=%u res_id=%u iosurf_id=%u rect=%ux%u+%u+%u tex_id=%u\n",
                 ss.scanout_id, ss.resource_id, iosurf_id, ss.r.width, ss.r.height, ss.r.x, ss.r.y, info.tex_id);
+#endif
         qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
                             ss.r.width, ss.r.height);
         if (info.tex_id > 0) {
@@ -874,7 +878,9 @@ static void virgl_resource_attach_backing(VirtIOGPU *g,
         res->base.iov = res_iovs;
         res->base.iov_cnt = res_niov;
     }
+#ifdef DEBUG_SCANOUT
     fprintf(stderr, "[VIRGL-ATTACH-BACKING] res_id=%u niov=%u\n", att_rb.resource_id, res_niov);
+#endif
 }
 
 static void virgl_resource_detach_backing(VirtIOGPU *g,
@@ -1214,8 +1220,10 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         iosurf_id = virtio_gpu_hostmem_create_scanout_iosurface(g, ss.resource_id, ss.r.width, ss.r.height);
     }
 
+#ifdef DEBUG_SCANOUT
     fprintf(stderr, "[VIRGL-SET-SCANOUT-BLOB-ACCEPTED] scanout_id=%u res_id=%u iosurf_id=%u rect=%ux%u+%u+%u\n",
             ss.scanout_id, ss.resource_id, iosurf_id, ss.r.width, ss.r.height, ss.r.x, ss.r.y);
+#endif
     g->parent_obj.enable = 1;
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
     g->parent_obj.scanout[ss.scanout_id].width = ss.r.width;

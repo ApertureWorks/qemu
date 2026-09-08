@@ -70,6 +70,7 @@ struct VirtIOGPUMacOSHostMem {
 };
 
 static void audit_hostmem_surface(IOSurfaceRef surface, uint32_t res_id, uint32_t iosurf_id) {
+#ifdef DEBUG_SCANOUT
     if (!surface) return;
     IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
     uint32_t *base = (uint32_t *)IOSurfaceGetBaseAddress(surface);
@@ -95,6 +96,7 @@ static void audit_hostmem_surface(IOSurfaceRef surface, uint32_t res_id, uint32_
             fclose(f);
         }
     }
+#endif
 }
 
 static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_resource *res);
@@ -134,6 +136,7 @@ static void gpu_sock_timer_cb(void *opaque)
         }
     }
 
+#ifdef DEBUG_SCANOUT
     /* Audit all active hostmem IOSurfaces */
     if (s_gpu_device) {
         struct virtio_gpu_simple_resource *res;
@@ -149,6 +152,7 @@ static void gpu_sock_timer_cb(void *opaque)
     if (s_gpu_sock_timer) {
         timer_mod(s_gpu_sock_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 500);
     }
+#endif
 }
 
 /* Called from VKR threads — only schedules work; no I/O ops. */
@@ -829,45 +833,35 @@ void virtio_gpu_hostmem_sync_scanout(uint32_t res_id, struct virtio_gpu_simple_r
     if (!res || !res->iov || res->iov_cnt == 0) {
         return;
     }
+
+    void *addr = res->remapped;
+    size_t alloc_size = res->blob_size;
     IOSurfaceRef surf = NULL;
     bool need_release = false;
-    if (res_id < 8192 && s_scanout_iosurfaces[res_id]) {
-        surf = s_scanout_iosurfaces[res_id];
-    } else {
-        uint32_t iosurf_id = virtio_gpu_hostmem_lookup_iosurface_id(res_id);
-        if (iosurf_id > 0) {
-            surf = IOSurfaceLookup(iosurf_id);
-            need_release = true;
+
+    if (!addr || alloc_size == 0) {
+        if (res_id < 8192 && s_scanout_iosurfaces[res_id]) {
+            surf = s_scanout_iosurfaces[res_id];
+        } else {
+            uint32_t iosurf_id = virtio_gpu_hostmem_lookup_iosurface_id(res_id);
+            if (iosurf_id > 0) {
+                surf = IOSurfaceLookup(iosurf_id);
+                need_release = true;
+            }
         }
-    }
-    if (!surf) {
-        return;
+        if (!surf) {
+            return;
+        }
+        addr = IOSurfaceGetBaseAddress(surf);
+        alloc_size = IOSurfaceGetAllocSize(surf);
     }
 
-    IOSurfaceLock(surf, 0, NULL);
-    void *addr = IOSurfaceGetBaseAddress(surf);
-    size_t alloc_size = IOSurfaceGetAllocSize(surf);
     if (addr && alloc_size > 0) {
         size_t copy_size = (res->blob_size > 0 && res->blob_size <= alloc_size) ? res->blob_size : alloc_size;
         iov_to_buf(res->iov, res->iov_cnt, 0, addr, copy_size);
-
-        uint32_t *pix = (uint32_t *)addr;
-        size_t npix = copy_size / 4;
-        size_t nz = 0;
-        uint32_t first = 0;
-        for (size_t p = 0; p < npix; p += 64) {
-            if (pix[p] != 0) {
-                nz++;
-                if (first == 0) first = pix[p];
-            }
-        }
-        if (nz > 0) {
-            fprintf(stderr, "[VIRGL-SCANOUT-SYNC-NZ] res_id=%u copy_size=%zu nz_samples=%zu first=0x%08X\n",
-                    res_id, copy_size, nz, first);
-        }
     }
-    IOSurfaceUnlock(surf, 0, NULL);
-    if (need_release) {
+
+    if (need_release && surf) {
         CFRelease(surf);
     }
 }
