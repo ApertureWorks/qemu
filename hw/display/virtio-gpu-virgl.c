@@ -760,39 +760,6 @@ static void virgl_cmd_transfer_to_host_2d(VirtIOGPU *g,
         iov_to_buf(res->base.iov, res->base.iov_cnt, t2d.offset,
                    res->base.remapped + t2d.offset,
                    res->base.blob_size > t2d.offset ? res->base.blob_size - t2d.offset : 0);
-
-        size_t pixel_count = res->base.blob_size / 4;
-        uint32_t *pixels = (uint32_t *)res->base.remapped;
-        size_t non_zero = 0;
-        uint32_t first_pixel = 0;
-        for (size_t i = 0; i < pixel_count; i++) {
-            if (pixels[i] != 0) {
-                non_zero++;
-                if (first_pixel == 0) first_pixel = pixels[i];
-            }
-        }
-        if (non_zero > 0) {
-            fprintf(stderr, "[QEMU-2D-TRANSFER] res_id=%u: non_zero=%zu/%zu (first=0x%08X)\n",
-                    t2d.resource_id, non_zero, pixel_count, first_pixel);
-            FILE *af = fopen("/tmp/aperture_2d_audit.txt", "w");
-            if (af) {
-                fprintf(af, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
-                        t2d.resource_id, non_zero, pixel_count, first_pixel);
-                fclose(af);
-            }
-            FILE *wf = fopen("/Users/skanda/Documents/Coding Projects/Aperture/virglrender/build/2d_audit.txt", "w");
-            if (wf) {
-                fprintf(wf, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
-                        t2d.resource_id, non_zero, pixel_count, first_pixel);
-                fclose(wf);
-            }
-            FILE *diff_f = fopen("/Users/skanda/Documents/Coding Projects/Aperture/Desktop/Research/ZeroCopy/TRACK_B_DIFFERENTIAL_AUDIT.txt", "a");
-            if (diff_f) {
-                fprintf(diff_f, "TIMESTAMP=%ld | GUEST_2D_XFER(res=%u): non_zero=%zu/%zu (first=0x%08X)\n",
-                        time(NULL), t2d.resource_id, non_zero, pixel_count, first_pixel);
-                fclose(diff_f);
-            }
-        }
     }
 
     box.x = t2d.r.x;

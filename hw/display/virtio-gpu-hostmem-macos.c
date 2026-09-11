@@ -267,71 +267,10 @@ static void gpu_sock_read_cb(void *opaque)
                                ((uint32_t)res_buf[3]);
 
         /* Execute Zero-Encode Host-Initiated Direct Frame Transfer */
-        fprintf(stderr, "[QEMU-HOSTMEM] 0x03 cmd received for res_id=%u (g=%p, s_gpu_device=%p)\n", resource_id, g, s_gpu_device);
         if (g || s_gpu_device) {
             VirtIOGPU *dev = g ? g : s_gpu_device;
             struct virtio_gpu_simple_resource *res = virtio_gpu_find_resource(dev, resource_id);
-            
-            /* ========================================================================= */
-            /* DIFFERENTIAL AUDIT: Display 0 (Scanout) vs VirtualDisplay 2 (Requested)   */
-            /* ========================================================================= */
-            uint32_t disp0_res_id = dev->parent_obj.scanout[0].resource_id;
-            struct virtio_gpu_simple_resource *disp0_res = virtio_gpu_find_resource(dev, disp0_res_id);
-            
-            size_t disp0_non_zero = 0, disp0_total = 0;
-            uint32_t disp0_first = 0;
-            if (disp0_res && disp0_res->iov && disp0_res->iov_cnt > 0) {
-                size_t sz = disp0_res->blob_size ? (size_t)disp0_res->blob_size : ((size_t)disp0_res->width * disp0_res->height * 4);
-                if (sz > 0) {
-                    disp0_total = sz / 4;
-                    uint32_t *d0_buf = g_malloc0(sz);
-                    iov_to_buf(disp0_res->iov, disp0_res->iov_cnt, 0, d0_buf, sz);
-                    for (size_t i = 0; i < disp0_total; i++) {
-                        if (d0_buf[i] != 0) {
-                            disp0_non_zero++;
-                            if (disp0_first == 0) disp0_first = d0_buf[i];
-                        }
-                    }
-                    g_free(d0_buf);
-                }
-            }
-
-            size_t vd2_non_zero = 0, vd2_total = 0;
-            uint32_t vd2_first = 0;
-            if (res && res->iov && res->iov_cnt > 0) {
-                size_t sz = res->blob_size ? (size_t)res->blob_size : ((size_t)res->width * res->height * 4);
-                if (sz > 0) {
-                    vd2_total = sz / 4;
-                    uint32_t *vd2_buf = g_malloc0(sz);
-                    iov_to_buf(res->iov, res->iov_cnt, 0, vd2_buf, sz);
-                    for (size_t i = 0; i < vd2_total; i++) {
-                        if (vd2_buf[i] != 0) {
-                            vd2_non_zero++;
-                            if (vd2_first == 0) vd2_first = vd2_buf[i];
-                        }
-                    }
-                    g_free(vd2_buf);
-                }
-            }
-
-            fprintf(stderr, "\n[QEMU-DIFFERENTIAL-AUDIT] ====================================================\n");
-            fprintf(stderr, "[QEMU-DIFFERENTIAL-AUDIT] Display 0   (res_id=%u): non_zero=%zu/%zu (first=0x%08X)\n",
-                    disp0_res_id, disp0_non_zero, disp0_total, disp0_first);
-            fprintf(stderr, "[QEMU-DIFFERENTIAL-AUDIT] VirtualDisp2(res_id=%u): non_zero=%zu/%zu (first=0x%08X)\n",
-                    resource_id, vd2_non_zero, vd2_total, vd2_first);
-            fprintf(stderr, "[QEMU-DIFFERENTIAL-AUDIT] ====================================================\n\n");
-
-            FILE *diff_f = fopen("/Users/skanda/Documents/Coding Projects/Aperture/Desktop/Research/ZeroCopy/TRACK_B_DIFFERENTIAL_AUDIT.txt", "a");
-            if (diff_f) {
-                fprintf(diff_f, "TIMESTAMP=%ld | Display0(res=%u): non_zero=%zu/%zu (first=0x%08X) | VD2(res=%u): non_zero=%zu/%zu (first=0x%08X)\n",
-                        time(NULL), disp0_res_id, disp0_non_zero, disp0_total, disp0_first,
-                        resource_id, vd2_non_zero, vd2_total, vd2_first);
-                fclose(diff_f);
-            }
-            
             if (res) {
-                fprintf(stderr, "[QEMU-HOSTMEM] res %u found: blob_size=%" PRIu64 ", w=%u, h=%u, remapped=%p, iov=%p, iov_cnt=%u\n",
-                        resource_id, res->blob_size, res->width, res->height, res->remapped, res->iov, res->iov_cnt);
                 if (!res->remapped && !res->hostmem_priv) {
                     if (res->blob_size == 0) {
                         res->blob_size = (size_t)res->width * res->height * 4;
@@ -340,97 +279,20 @@ static void gpu_sock_read_cb(void *opaque)
                         macos_hostmem_create_resource(dev, res);
                     }
                 }
-                
+
                 size_t transfer_size = res->blob_size ? (size_t)res->blob_size
                                                        : ((size_t)res->width * res->height * 4);
-                const uint8_t *pixel_src = NULL;
-                bool free_pixel_src = false;
 
-                if (res->iov && res->iov_cnt > 0 && transfer_size > 0) {
-                    /* Standard 2D resource path: pixel data lives in guest-RAM iovecs. */
-                    uint8_t *temp_buf = g_malloc0(transfer_size);
-                    if (res->remapped) {
-                        iov_to_buf(res->iov, res->iov_cnt, 0, res->remapped, transfer_size);
-                    }
-                    iov_to_buf(res->iov, res->iov_cnt, 0, temp_buf, transfer_size);
-                    pixel_src = temp_buf;
-                    free_pixel_src = true;
-                    fprintf(stderr, "[QEMU-HOSTMEM] res %u: reading via iov_to_buf (2D path)\n", resource_id);
-                } else if (res->remapped && transfer_size > 0) {
-                    /* hostmem_priv IOSurface path: remapped is locked IOSurface base address. */
-                    fprintf(stderr, "[QEMU-HOSTMEM] res %u: reading from res->remapped (hostmem path) %p\n",
-                            resource_id, res->remapped);
-                    uint8_t *temp_buf = g_malloc0(transfer_size);
-                    memcpy(temp_buf, res->remapped, transfer_size);
-                    pixel_src = temp_buf;
-                    free_pixel_src = true;
-                } else {
-                    /* Blob resource path: pixel data lives in virgl's map_fixed (vm_remap'd IOSurface). */
-                    size_t blob_sz = 0;
-                    void *blob_map = virtio_gpu_hostmem_get_blob_map(dev, resource_id, &blob_sz);
-                    if (blob_map && blob_sz > 0) {
-                        if (transfer_size == 0) {
-                            transfer_size = blob_sz;
-                        }
-                        fprintf(stderr, "[QEMU-HOSTMEM] res %u: reading from blob map_fixed %p size=%zu (blob path)\n",
-                                resource_id, blob_map, transfer_size);
-                        uint8_t *temp_buf = g_malloc0(transfer_size);
-                        memcpy(temp_buf, blob_map, transfer_size);
-                        pixel_src = temp_buf;
-                        free_pixel_src = true;
-                    } else {
-                        fprintf(stderr, "[QEMU-HOSTMEM] res %u: no pixel data — remapped=%p, iov=%p, blob_map=%p\n",
-                                resource_id, res->remapped, res->iov, blob_map);
-                    }
-                }
-
-                if (pixel_src && transfer_size > 0) {
-                    uint32_t *pixels = (uint32_t *)pixel_src;
-                    size_t pixel_count = transfer_size / 4;
-                    size_t non_zero = 0;
-                    uint32_t first_pixel = 0;
-                    for (size_t i = 0; i < pixel_count; i++) {
-                        if (pixels[i] != 0) {
-                            non_zero++;
-                            if (first_pixel == 0) first_pixel = pixels[i];
-                        }
-                    }
-                    fprintf(stderr, "[QEMU-HOSTMEM-AUDIT] res_id=%u: non_zero=%zu/%zu (first=0x%08X)\n",
-                            resource_id, non_zero, pixel_count, first_pixel);
-
-                    FILE *rf = fopen("/tmp/aperture_display_2.raw", "wb");
-                    if (rf) {
-                        fwrite(pixel_src, 1, transfer_size, rf);
-                        fclose(rf);
-                    }
-                    FILE *prf = fopen("/private/tmp/aperture_display_2.raw", "wb");
-                    if (prf) {
-                        fwrite(pixel_src, 1, transfer_size, prf);
-                        fclose(prf);
-                    }
-
-                    FILE *af = fopen("/tmp/aperture_2d_audit.txt", "w");
-                    if (af) {
-                        fprintf(af, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
-                                resource_id, non_zero, pixel_count, first_pixel);
-                        fclose(af);
-                    }
-                    FILE *paf = fopen("/private/tmp/aperture_2d_audit.txt", "w");
-                    if (paf) {
-                        fprintf(paf, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
-                                resource_id, non_zero, pixel_count, first_pixel);
-                        fclose(paf);
-                    }
-                    FILE *wf = fopen("/Users/skanda/Documents/Coding Projects/Aperture/virglrender/build/2d_audit.txt", "w");
-                    if (wf) {
-                        fprintf(wf, "res_id=%u non_zero=%zu total=%zu first=0x%08X\n",
-                                resource_id, non_zero, pixel_count, first_pixel);
-                        fclose(wf);
-                    }
-                    if (free_pixel_src) { g_free((void *)pixel_src); }
+                /*
+                 * Component 1 Fix:
+                 * Only copy if this is a standard 2D guest-RAM buffer (res->hostmem_priv == NULL).
+                 * If res->hostmem_priv != NULL, it is directly Stage-2 mapped (HOST3D/hostmem blob),
+                 * so guest GPU renders straight into host IOSurface memory (true zero-copy).
+                 */
+                if (!res->hostmem_priv && res->iov && res->iov_cnt > 0 && res->remapped && transfer_size > 0) {
+                    iov_to_buf(res->iov, res->iov_cnt, 0, res->remapped, transfer_size);
                 }
             } else {
-                fprintf(stderr, "[QEMU-HOSTMEM] res %u NOT FOUND in dev %p!\n", resource_id, dev);
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "[QEMU-HostMem] Transfer requested for missing res_id=%u (ignoring safely)\n",
                               resource_id);
@@ -569,10 +431,11 @@ void *virtio_gpu_hostmem_lookup_iosurface_base(uint32_t res_id)
 __attribute__((visibility("default")))
 void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_id)
 {
-    fprintf(stderr, "[QEMU-HOSTMEM-NOTIFY-CREATED] res_id=%u, iosurf_id=%u\n", resource_id, iosurface_id);
     if (resource_id < 8192) {
         atomic_store_explicit(&s_res_to_iosurf[resource_id], iosurface_id, memory_order_release);
     }
+#ifdef DEBUG_SCANOUT
+    fprintf(stderr, "[QEMU-HOSTMEM-NOTIFY-CREATED] res_id=%u, iosurf_id=%u\n", resource_id, iosurface_id);
     FILE *f = fopen("/tmp/aperture_latest_2d_iosurface.txt", "w");
     if (f) {
         fprintf(f, "%u %u\n", resource_id, iosurface_id);
@@ -588,6 +451,7 @@ void virtio_gpu_hostmem_notify_created(uint32_t resource_id, uint32_t iosurface_
         fprintf(wf, "%u %u\n", resource_id, iosurface_id);
         fclose(wf);
     }
+#endif
 
     /*
      * VKR-thread-safe path: enqueue into the ring buffer and schedule the BH.
