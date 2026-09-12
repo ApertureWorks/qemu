@@ -94,6 +94,7 @@ static void handle_tx(VirtIODevice *vdev, VirtQueue *vq)
                 vsock->connected = true;
 
                 send_rx_pkt(vsock, VIRTIO_VSOCK_OP_RESPONSE, NULL, 0);
+                qemu_chr_fe_accept_input(&vsock->chr);
             } else if (op == VIRTIO_VSOCK_OP_RW && len > 0) {
                 uint8_t *buf = g_malloc(len);
                 iov_to_buf(elem->out_sg, elem->out_num, sizeof(hdr), buf, len);
@@ -115,6 +116,10 @@ static void handle_tx(VirtIODevice *vdev, VirtQueue *vq)
 
 static void handle_rx(VirtIODevice *vdev, VirtQueue *vq)
 {
+    VirtIOVSockSocket *vsock = VIRTIO_VSOCK_SOCKET(vdev);
+    if (vsock->connected) {
+        qemu_chr_fe_accept_input(&vsock->chr);
+    }
 }
 
 static void handle_event(VirtIODevice *vdev, VirtQueue *vq)
