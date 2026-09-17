@@ -75,6 +75,12 @@ virtio_gpu_base_generate_edid(VirtIOGPUBase *g, int scanout,
         }
     }
 
+    char default_name[32];
+    snprintf(default_name, sizeof(default_name), "Virtual-%d", scanout + 1);
+    if (!info.name) {
+        info.name = default_name;
+    }
+
     edid->size = cpu_to_le32(sizeof(edid->edid));
     qemu_edid_generate(edid->edid, sizeof(edid->edid), &info);
 }
@@ -195,10 +201,12 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
         return false;
     }
 
-    g->enabled_output_bitmask = 1;
+    g->enabled_output_bitmask = (g->conf.max_outputs >= 32) ? 0xFFFFFFFF : ((1U << g->conf.max_outputs) - 1);
 
-    g->req_state[0].width = g->conf.xres;
-    g->req_state[0].height = g->conf.yres;
+    for (i = 0; i < g->conf.max_outputs; i++) {
+        g->req_state[i].width = g->conf.xres ? g->conf.xres : 1280;
+        g->req_state[i].height = g->conf.yres ? g->conf.yres : 800;
+    }
 
     for (output_idx = 0, node = g->conf.outputs;
          node; output_idx++, node = node->next) {
