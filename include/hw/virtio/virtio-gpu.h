@@ -57,6 +57,7 @@ struct virtio_gpu_simple_resource {
     uint64_t hostmem;
 
     uint64_t blob_size;
+    uint32_t blob_mem;
     void *blob;
     int dmabuf_fd;
     uint8_t *remapped;

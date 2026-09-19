@@ -234,6 +234,25 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
     }
 #endif
 
+#ifdef __APPLE__
+    void *surf_base = virtio_gpu_hostmem_lookup_iosurface_base(res->base.resource_id);
+    if (surf_base) {
+        data = surf_base;
+        size = res->base.blob_size;
+        ret = 0;
+        fprintf(stderr, "[VIRGL-MAP-IOSURFACE-DIRECT] ✅ res_id=%u mapped directly to IOSurface base=%p size=%llu\n",
+                res->base.resource_id, data, (unsigned long long)size);
+    } else {
+        ret = virgl_renderer_resource_map(res->base.resource_id, &data, &size);
+        fprintf(stderr, "[VIRGL-MAP-BLOB-CALL] res_id=%u ret=%d data=%p size=%llu\n",
+                res->base.resource_id, ret, data, (unsigned long long)size);
+        if (ret) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to map virgl resource: %s\n",
+                          __func__, strerror(-ret));
+            return ret;
+        }
+    }
+#else
     ret = virgl_renderer_resource_map(res->base.resource_id, &data, &size);
     fprintf(stderr, "[VIRGL-MAP-BLOB-CALL] res_id=%u ret=%d data=%p size=%llu\n",
             res->base.resource_id, ret, data, (unsigned long long)size);
@@ -242,14 +261,7 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
                       __func__, strerror(-ret));
         return ret;
     }
-
-#ifdef __APPLE__
-    void *surf_base = virtio_gpu_hostmem_lookup_iosurface_base(res->base.resource_id);
-    if (surf_base) {
-        data = surf_base;
-        fprintf(stderr, "[VIRGL-MAP-IOSURFACE-DIRECT] ✅ res_id=%u mapped directly to IOSurface base=%p\n",
-                res->base.resource_id, data);
-    }
+#endif
 
     if (gl->hostmem_mmap) {
         vm_address_t target = (vm_address_t)(gl->hostmem_mmap + offset);
@@ -289,7 +301,6 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
                 res->base.resource_id, (unsigned long long)start_gpa, (unsigned long long)aligned_size, aligned_uva, hv_ret);
 #endif
     }
-#endif
 
     return 0;
 }
@@ -983,6 +994,7 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
     res = g_new0(struct virtio_gpu_virgl_resource, 1);
     res->base.resource_id = cblob.resource_id;
     res->base.blob_size = cblob.size;
+    res->base.blob_mem = cblob.blob_mem;
     res->base.dmabuf_fd = -1;
 
     if (cblob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D) {
@@ -994,6 +1006,27 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
             return;
         }
     }
+
+#if defined(CONFIG_DARWIN) || defined(__APPLE__)
+    /* When minigbm allocates HOST3D scanouts outside of a 3D context (ctx_id == 0),
+     * bypass virglrenderer (which strictly requires a valid Vulkan device memory context)
+     * and allocate the host IOSurfaceRef directly via macos_hostmem_create_resource().
+     */
+    if (cblob.hdr.ctx_id == 0 && cblob.blob_mem == VIRTIO_GPU_BLOB_MEM_HOST3D) {
+        ret = virtio_gpu_hostmem_create_resource(g, &res->base);
+        if (ret < 0) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            virtio_gpu_cleanup_mapping(g, &res->base);
+            return;
+        }
+        res->base.dmabuf_fd = (int)virtio_gpu_hostmem_get_iosurface_id(&res->base);
+        fprintf(stderr, "[VIRGL-CREATE-BLOB-HOST3D] ✅ res_id=%u size=%llu iosurf_id=%d (Stage-2 HostMem IOSurface bypass)\n",
+                cblob.resource_id, (unsigned long long)cblob.size, res->base.dmabuf_fd);
+        QTAILQ_INSERT_HEAD(&g->reslist, &res->base, next);
+        g_steal_pointer(&res);
+        return;
+    }
+#endif
 
     virgl_args.res_handle = cblob.resource_id;
     virgl_args.ctx_id = cblob.hdr.ctx_id;
@@ -1080,7 +1113,10 @@ static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
 
     memset(&resp, 0, sizeof(resp));
     resp.hdr.type = VIRTIO_GPU_RESP_OK_MAP_INFO;
-    virgl_renderer_resource_get_map_info(mblob.resource_id, &resp.map_info);
+    ret = virgl_renderer_resource_get_map_info(mblob.resource_id, &resp.map_info);
+    if (ret != 0) {
+        resp.map_info = 0x01; /* VIRTGPU_MAP_CACHE_CACHED */
+    }
     virtio_gpu_ctrl_response(g, cmd, &resp.hdr, sizeof(resp));
 }
 
@@ -1187,10 +1223,8 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         iosurf_id = virtio_gpu_hostmem_create_scanout_iosurface(g, ss.resource_id, ss.r.width, ss.r.height);
     }
 
-#ifdef DEBUG_SCANOUT
     fprintf(stderr, "[VIRGL-SET-SCANOUT-BLOB-ACCEPTED] scanout_id=%u res_id=%u iosurf_id=%u rect=%ux%u+%u+%u\n",
             ss.scanout_id, ss.resource_id, iosurf_id, ss.r.width, ss.r.height, ss.r.x, ss.r.y);
-#endif
     g->parent_obj.enable = 1;
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
     g->parent_obj.scanout[ss.scanout_id].width = ss.r.width;

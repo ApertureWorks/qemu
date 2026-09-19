@@ -694,6 +694,20 @@ uint32_t virtio_gpu_hostmem_create_scanout_iosurface(VirtIOGPU *g, uint32_t res_
 
 void virtio_gpu_hostmem_sync_scanout(uint32_t res_id, struct virtio_gpu_simple_resource *res)
 {
+    /* TRUE ZERO-COPY: If the resource is backed by a Stage-2 HVF direct-mapped
+     * host allocation (VIRTGPU_BLOB_MEM_HOST3D), the guest GPU renders directly into host DRAM.
+     * Synchronous CPU copy via iov_to_buf is redundant and skipped.
+     */
+    if (res && res->blob_mem == VIRTIO_GPU_BLOB_MEM_HOST3D) {
+        static uint32_t s_last_bypass_res = 0;
+        if (s_last_bypass_res != res_id) {
+            s_last_bypass_res = res_id;
+            fprintf(stderr, "[ZERO-COPY-SCANOUT-SYNC-BYPASS] res_id=%u remapped=%p (0 CPU copies, 0 iov_to_buf)\n",
+                    res_id, res->remapped);
+        }
+        return;
+    }
+
     if (!res || !res->iov || res->iov_cnt == 0) {
         return;
     }
@@ -722,6 +736,12 @@ void virtio_gpu_hostmem_sync_scanout(uint32_t res_id, struct virtio_gpu_simple_r
 
     if (addr && alloc_size > 0) {
         size_t copy_size = (res->blob_size > 0 && res->blob_size <= alloc_size) ? res->blob_size : alloc_size;
+        static uint32_t s_last_fallback_res = 0;
+        if (s_last_fallback_res != res_id) {
+            s_last_fallback_res = res_id;
+            fprintf(stderr, "[IOV-TO-BUF-FALLBACK] Early 2D Scanout res_id=%u copy_size=%zu\n",
+                    res_id, copy_size);
+        }
         iov_to_buf(res->iov, res->iov_cnt, 0, addr, copy_size);
     }
 
