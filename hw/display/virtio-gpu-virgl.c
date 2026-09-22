@@ -1060,10 +1060,12 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
     res->base.dmabuf_fd = info.fd;
 
 #if defined(CONFIG_DARWIN) || defined(__APPLE__)
-    /* For zero-copy on macOS, the fd returned by virglrenderer is actually the IOSurface ID */
-    if (info.fd > 0) {
-        virtio_gpu_hostmem_notify_created(cblob.resource_id, (uint32_t)info.fd);
-    } else if (res->base.blob_size > 0) {
+    /* For zero-copy on macOS, virglrenderer (vkr_metal_helpers.m) registers the real
+     * IOSurface ID directly via virtio_gpu_hostmem_notify_created(res_id, iosurf_id).
+     * info.fd is a Unix SHM file descriptor, NOT an IOSurface ID.
+     * Only create a fallback IOSurface if virglrenderer hasn't already registered one.
+     */
+    if (res->base.blob_size > 0 && virtio_gpu_hostmem_lookup_iosurface_id(cblob.resource_id) == 0) {
         virtio_gpu_hostmem_create_resource(g, &res->base);
     }
 #endif
