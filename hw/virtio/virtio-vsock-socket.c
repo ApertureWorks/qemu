@@ -39,11 +39,13 @@ static void send_rx_pkt(VirtIOVSockSocket *vsock, uint16_t op, const uint8_t *bu
     VirtQueueElement *elem;
 
     if (!virtio_queue_ready(vsock->rx_vq)) {
+        fprintf(stderr, "[VSOCK-DEVICE] send_rx_pkt DROP: rx_vq not ready!\n");
         return;
     }
 
     elem = virtqueue_pop(vsock->rx_vq, sizeof(VirtQueueElement));
     if (!elem) {
+        fprintf(stderr, "[VSOCK-DEVICE] send_rx_pkt DROP: rx_vq empty!\n");
         return;
     }
 
@@ -65,6 +67,7 @@ static void send_rx_pkt(VirtIOVSockSocket *vsock, uint16_t op, const uint8_t *bu
         offset += iov_from_buf(elem->in_sg, elem->in_num, sizeof(hdr), buf, len);
     }
 
+    fprintf(stderr, "[VSOCK-DEVICE] send_rx_pkt: op=%u len=%zu to peer_port=%u\n", op, len, vsock->peer_port);
     virtqueue_push(vsock->rx_vq, elem, offset);
     g_free(elem);
     virtio_notify(vdev, vsock->rx_vq);
@@ -93,17 +96,20 @@ static void handle_tx(VirtIODevice *vdev, VirtQueue *vq)
                 vsock->host_port = dst_port;
                 vsock->connected = true;
 
+                fprintf(stderr, "[VSOCK-DEVICE] Guest OP_REQUEST: src_port=%u dst_port=%u\n", src_port, dst_port);
                 send_rx_pkt(vsock, VIRTIO_VSOCK_OP_RESPONSE, NULL, 0);
                 qemu_chr_fe_accept_input(&vsock->chr);
             } else if (op == VIRTIO_VSOCK_OP_RW && len > 0) {
                 uint8_t *buf = g_malloc(len);
                 iov_to_buf(elem->out_sg, elem->out_num, sizeof(hdr), buf, len);
+                fprintf(stderr, "[VSOCK-DEVICE] Guest OP_RW: writing %u bytes to host socket\n", len);
                 qemu_chr_fe_write_all(&vsock->chr, buf, len);
                 g_free(buf);
                 vsock->rx_fwd_cnt += len;
             } else if (op == VIRTIO_VSOCK_OP_CREDIT_REQUEST) {
                 send_rx_pkt(vsock, VIRTIO_VSOCK_OP_CREDIT_UPDATE, NULL, 0);
             } else if (op == VIRTIO_VSOCK_OP_SHUTDOWN || op == VIRTIO_VSOCK_OP_RST) {
+                fprintf(stderr, "[VSOCK-DEVICE] Guest SHUTDOWN/RST (op=%u)\n", op);
                 vsock->connected = false;
             }
         }
@@ -138,8 +144,31 @@ static int chr_can_read(void *opaque)
 static void chr_read(void *opaque, const uint8_t *buf, int size)
 {
     VirtIOVSockSocket *vsock = opaque;
+    fprintf(stderr, "[VSOCK-DEVICE] chr_read from host: size=%d connected=%d\n", size, vsock->connected);
     if (size > 0 && vsock->connected) {
         send_rx_pkt(vsock, VIRTIO_VSOCK_OP_RW, buf, (size_t)size);
+    }
+}
+
+static void chr_event(void *opaque, QEMUChrEvent event)
+{
+    VirtIOVSockSocket *vsock = opaque;
+    fprintf(stderr, "[VSOCK-DEVICE] chr_event: %d (connected=%d)\n", event, vsock->connected);
+    switch (event) {
+    case CHR_EVENT_OPENED:
+        if (vsock->connected) {
+            qemu_chr_fe_accept_input(&vsock->chr);
+        }
+        break;
+    case CHR_EVENT_CLOSED:
+        if (vsock->connected) {
+            fprintf(stderr, "[VSOCK-DEVICE] Host closed socket, sending OP_RST to guest\n");
+            send_rx_pkt(vsock, VIRTIO_VSOCK_OP_RST, NULL, 0);
+            vsock->connected = false;
+        }
+        break;
+    default:
+        break;
     }
 }
 
@@ -164,7 +193,7 @@ static void virtio_vsock_socket_realize(DeviceState *dev, Error **errp)
     vsock->tx_vq = virtio_add_queue(vdev, 128, handle_tx);
     vsock->event_vq = virtio_add_queue(vdev, 128, handle_event);
 
-    qemu_chr_fe_set_handlers(&vsock->chr, chr_can_read, chr_read, NULL, NULL,
+    qemu_chr_fe_set_handlers(&vsock->chr, chr_can_read, chr_read, chr_event, NULL,
                              vsock, NULL, true);
 }
 
