@@ -28,14 +28,6 @@ Aperture's QEMU fork powers the virtualization of LineageOS (ARM64) on macOS wit
 
 ---
 
-## Consumer & Developer Benefits
-
-- **Performance:** Fluid 60 FPS multi-window Android UI rendering on macOS Apple Silicon without video encoder artifacts.
-- **Battery Life:** Zero CPU encoding loops reduce battery draw and thermals during long sessions.
-- **Maintainability:** Minimal, isolated patches against upstream QEMU's `hw/display/` and `backends/` directories.
-
----
-
 ## Building
 
 ### Prerequisites (macOS)
