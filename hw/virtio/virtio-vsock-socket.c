@@ -71,7 +71,6 @@ static void send_rx_pkt(VirtIOVSockSocket *vsock, uint16_t op, const uint8_t *bu
         offset += iov_from_buf(elem->in_sg, elem->in_num, sizeof(hdr), buf, len);
     }
 
-    fprintf(stderr, "[VSOCK-DEVICE] send_rx_pkt: op=%u len=%zu to peer_port=%u\n", op, len, vsock->peer_port);
     virtqueue_push(vsock->rx_vq, elem, offset);
     g_free(elem);
     virtio_notify(vdev, vsock->rx_vq);
@@ -80,10 +79,6 @@ static void send_rx_pkt(VirtIOVSockSocket *vsock, uint16_t op, const uint8_t *bu
 static void flush_rx(VirtIOVSockSocket *vsock)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(vsock);
-
-    fprintf(stderr, "[VSOCK-DEVICE] flush_rx ENTER: connected=%d ready=%d offset=%zu len=%zu\n",
-            vsock->connected, virtio_queue_ready(vsock->rx_vq),
-            vsock->rx_buf_offset, vsock->rx_buf_len);
 
     if (!vsock->connected || !virtio_queue_ready(vsock->rx_vq)) {
         return;
@@ -127,8 +122,6 @@ static void flush_rx(VirtIOVSockSocket *vsock)
                                vsock->rx_buf + vsock->rx_buf_offset, chunk_len);
 
         vsock->rx_buf_offset += chunk_len;
-        fprintf(stderr, "[VSOCK-DEVICE] flush_rx: pushed %zu bytes (op=RW) to guest peer_port=%u (offset=%zu/%zu)\n",
-                chunk_len, vsock->peer_port, vsock->rx_buf_offset, vsock->rx_buf_len);
         virtqueue_push(vsock->rx_vq, elem, offset);
         g_free(elem);
         virtio_notify(vdev, vsock->rx_vq);
@@ -177,7 +170,6 @@ static void handle_tx(VirtIODevice *vdev, VirtQueue *vq)
             } else if (op == VIRTIO_VSOCK_OP_RW && len > 0) {
                 uint8_t *buf = g_malloc(len);
                 iov_to_buf(elem->out_sg, elem->out_num, sizeof(hdr), buf, len);
-                fprintf(stderr, "[VSOCK-DEVICE] Guest OP_RW: writing %u bytes to host socket\n", len);
                 qemu_chr_fe_write_all(&vsock->chr, buf, len);
                 g_free(buf);
                 vsock->rx_fwd_cnt += len;
@@ -201,8 +193,6 @@ static void handle_tx(VirtIODevice *vdev, VirtQueue *vq)
 static void handle_rx(VirtIODevice *vdev, VirtQueue *vq)
 {
     VirtIOVSockSocket *vsock = VIRTIO_VSOCK_SOCKET(vdev);
-    fprintf(stderr, "[VSOCK-DEVICE] handle_rx CALLED: connected=%d ready=%d len=%zu\n",
-            vsock->connected, virtio_queue_ready(vsock->rx_vq), vsock->rx_buf_len);
     if (vsock->connected) {
         flush_rx(vsock);
         if (vsock->rx_buf_len == 0) {
@@ -231,9 +221,6 @@ static void chr_read(void *opaque, const uint8_t *buf, int size)
         return;
     }
 
-    fprintf(stderr, "[VSOCK-DEVICE] chr_read: received %d bytes from host (current buf_len=%zu, connected=%d)\n",
-            size, vsock->rx_buf_len, vsock->connected);
-
     if (vsock->rx_buf_len + (size_t)size > sizeof(vsock->rx_buf)) {
         fprintf(stderr, "[VSOCK-DEVICE] chr_read OVERFLOW: dropping excess %d bytes\n", size);
         return;
@@ -247,7 +234,6 @@ static void chr_read(void *opaque, const uint8_t *buf, int size)
 static void chr_event(void *opaque, QEMUChrEvent event)
 {
     VirtIOVSockSocket *vsock = opaque;
-    fprintf(stderr, "[VSOCK-DEVICE] chr_event: %d (connected=%d)\n", event, vsock->connected);
     switch (event) {
     case CHR_EVENT_OPENED:
         flush_rx(vsock);

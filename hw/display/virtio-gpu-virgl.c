@@ -749,8 +749,6 @@ static void virgl_cmd_submit_3d(VirtIOGPU *g,
     if (ret) {
         fprintf(stderr, "[VIRGL-SUBMIT-FAIL] ctx_id=%u size=%u ret=%d\n", cs.hdr.ctx_id, cs.size, ret);
         cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
-    } else {
-        fprintf(stderr, "[VIRGL-SUBMIT-OK] ctx_id=%u size=%u\n", cs.hdr.ctx_id, cs.size);
     }
 
 out:
@@ -1087,9 +1085,6 @@ static void virgl_cmd_resource_map_blob(VirtIOGPU *g,
     VIRTIO_GPU_FILL_CMD(mblob);
     virtio_gpu_map_blob_bswap(&mblob);
 
-    fprintf(stderr, "[VIRGL-MAP-BLOB-CMD] res_id=%u offset=0x%llx\n",
-            mblob.resource_id, (unsigned long long)mblob.offset);
-
     res = virtio_gpu_virgl_find_resource(g, mblob.resource_id);
     if (!res) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource does not exist %d\n",
@@ -1225,8 +1220,6 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         iosurf_id = virtio_gpu_hostmem_create_scanout_iosurface(g, ss.resource_id, ss.r.width, ss.r.height);
     }
 
-    fprintf(stderr, "[VIRGL-SET-SCANOUT-BLOB-ACCEPTED] scanout_id=%u res_id=%u iosurf_id=%u rect=%ux%u+%u+%u\n",
-            ss.scanout_id, ss.resource_id, iosurf_id, ss.r.width, ss.r.height, ss.r.x, ss.r.y);
     g->parent_obj.enable = 1;
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
     g->parent_obj.scanout[ss.scanout_id].width = ss.r.width;

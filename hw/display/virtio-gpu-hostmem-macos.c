@@ -699,12 +699,6 @@ void virtio_gpu_hostmem_sync_scanout(uint32_t res_id, struct virtio_gpu_simple_r
      * Synchronous CPU copy via iov_to_buf is redundant and skipped.
      */
     if (res && res->blob_mem == VIRTIO_GPU_BLOB_MEM_HOST3D) {
-        static uint32_t s_last_bypass_res = 0;
-        if (s_last_bypass_res != res_id) {
-            s_last_bypass_res = res_id;
-            fprintf(stderr, "[ZERO-COPY-SCANOUT-SYNC-BYPASS] res_id=%u remapped=%p (0 CPU copies, 0 iov_to_buf)\n",
-                    res_id, res->remapped);
-        }
         return;
     }
 
