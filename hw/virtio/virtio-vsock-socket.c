@@ -87,8 +87,6 @@ static void flush_rx(VirtIOVSockSocket *vsock)
     while (vsock->rx_buf_offset < vsock->rx_buf_len) {
         VirtQueueElement *elem = virtqueue_pop(vsock->rx_vq, sizeof(VirtQueueElement));
         if (!elem) {
-            fprintf(stderr, "[VSOCK-DEVICE] flush_rx: virtqueue_pop returned NULL! (offset=%zu/%zu)\n",
-                    vsock->rx_buf_offset, vsock->rx_buf_len);
             break;
         }
 
@@ -162,6 +160,8 @@ static void handle_tx(VirtIODevice *vdev, VirtQueue *vq)
                 vsock->host_port = dst_port;
                 vsock->connected = true;
                 vsock->rx_fwd_cnt = 0;
+                vsock->rx_buf_len = 0;
+                vsock->rx_buf_offset = 0;
 
                 fprintf(stderr, "[VSOCK-DEVICE] Guest OP_REQUEST: src_port=%u dst_port=%u\n", src_port, dst_port);
                 send_rx_pkt(vsock, VIRTIO_VSOCK_OP_RESPONSE, NULL, 0);
@@ -208,6 +208,9 @@ static void handle_event(VirtIODevice *vdev, VirtQueue *vq)
 static int chr_can_read(void *opaque)
 {
     VirtIOVSockSocket *vsock = opaque;
+    if (!vsock->connected) {
+        return 0;
+    }
     if (vsock->rx_buf_len >= sizeof(vsock->rx_buf)) {
         return 0;
     }
@@ -217,7 +220,7 @@ static int chr_can_read(void *opaque)
 static void chr_read(void *opaque, const uint8_t *buf, int size)
 {
     VirtIOVSockSocket *vsock = opaque;
-    if (size <= 0) {
+    if (size <= 0 || !vsock->connected) {
         return;
     }
 
@@ -236,9 +239,11 @@ static void chr_event(void *opaque, QEMUChrEvent event)
     VirtIOVSockSocket *vsock = opaque;
     switch (event) {
     case CHR_EVENT_OPENED:
-        flush_rx(vsock);
-        if (vsock->rx_buf_len == 0) {
-            qemu_chr_fe_accept_input(&vsock->chr);
+        if (vsock->connected) {
+            flush_rx(vsock);
+            if (vsock->rx_buf_len == 0) {
+                qemu_chr_fe_accept_input(&vsock->chr);
+            }
         }
         break;
     case CHR_EVENT_CLOSED:
