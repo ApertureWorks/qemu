@@ -32,10 +32,29 @@ struct VirtIOVSockSocket {
     bool connected;
     uint32_t rx_fwd_cnt;
 
+    /*
+     * Credit-based flow control for host->guest data (virtio-vsock spec 5.10.6.3).
+     * The guest advertises its receive buffer (buf_alloc) and how many bytes its
+     * application has consumed (fwd_cnt) in EVERY packet it sends. We may have at
+     * most buf_alloc - (tx_cnt - fwd_cnt) bytes in flight. Sending beyond that
+     * makes the guest kernel drop packets, silently losing bytes of the stream.
+     */
+    uint32_t peer_buf_alloc;
+    uint32_t peer_fwd_cnt;
+    uint32_t tx_cnt;
+    bool credit_requested;
+
     uint8_t rx_buf[65536];
     size_t rx_buf_len;
     size_t rx_buf_offset;
 };
+
+static uint32_t tx_credit(VirtIOVSockSocket *vsock)
+{
+    uint32_t in_flight = vsock->tx_cnt - vsock->peer_fwd_cnt;
+
+    return in_flight >= vsock->peer_buf_alloc ? 0 : vsock->peer_buf_alloc - in_flight;
+}
 
 static void send_rx_pkt(VirtIOVSockSocket *vsock, uint16_t op, const uint8_t *buf, size_t len)
 {
@@ -85,7 +104,20 @@ static void flush_rx(VirtIOVSockSocket *vsock)
     }
 
     while (vsock->rx_buf_offset < vsock->rx_buf_len) {
-        VirtQueueElement *elem = virtqueue_pop(vsock->rx_vq, sizeof(VirtQueueElement));
+        uint32_t credit = tx_credit(vsock);
+        VirtQueueElement *elem;
+
+        if (credit == 0) {
+            /* Guest receive buffer is full: hold the data back until it reports progress. */
+            if (!vsock->credit_requested) {
+                vsock->credit_requested = true;
+                send_rx_pkt(vsock, VIRTIO_VSOCK_OP_CREDIT_REQUEST, NULL, 0);
+            }
+            break;
+        }
+        vsock->credit_requested = false;
+
+        elem = virtqueue_pop(vsock->rx_vq, sizeof(VirtQueueElement));
         if (!elem) {
             break;
         }
@@ -101,6 +133,9 @@ static void flush_rx(VirtIOVSockSocket *vsock)
         size_t avail = vsock->rx_buf_len - vsock->rx_buf_offset;
         size_t max_payload = total_in - sizeof(struct virtio_vsock_hdr);
         size_t chunk_len = avail < max_payload ? avail : max_payload;
+        if (chunk_len > credit) {
+            chunk_len = credit;
+        }
 
         struct virtio_vsock_hdr hdr;
         memset(&hdr, 0, sizeof(hdr));
@@ -120,6 +155,7 @@ static void flush_rx(VirtIOVSockSocket *vsock)
                                vsock->rx_buf + vsock->rx_buf_offset, chunk_len);
 
         vsock->rx_buf_offset += chunk_len;
+        vsock->tx_cnt += (uint32_t)chunk_len;
         virtqueue_push(vsock->rx_vq, elem, offset);
         g_free(elem);
         virtio_notify(vdev, vsock->rx_vq);
@@ -154,12 +190,19 @@ static void handle_tx(VirtIODevice *vdev, VirtQueue *vq)
             uint32_t src_port = le32_to_cpu(hdr.src_port);
             uint32_t dst_port = le32_to_cpu(hdr.dst_port);
 
+            /* Every guest packet carries its current receive-buffer size and consumed count. */
+            vsock->peer_buf_alloc = le32_to_cpu(hdr.buf_alloc);
+            vsock->peer_fwd_cnt = le32_to_cpu(hdr.fwd_cnt);
+
             if (op == VIRTIO_VSOCK_OP_REQUEST) {
                 vsock->peer_cid = src_cid;
                 vsock->peer_port = src_port;
                 vsock->host_port = dst_port;
                 vsock->connected = true;
                 vsock->rx_fwd_cnt = 0;
+                vsock->tx_cnt = 0;
+                vsock->peer_fwd_cnt = 0;
+                vsock->credit_requested = false;
                 vsock->rx_buf_len = 0;
                 vsock->rx_buf_offset = 0;
 
@@ -175,12 +218,23 @@ static void handle_tx(VirtIODevice *vdev, VirtQueue *vq)
                 vsock->rx_fwd_cnt += len;
             } else if (op == VIRTIO_VSOCK_OP_CREDIT_REQUEST) {
                 send_rx_pkt(vsock, VIRTIO_VSOCK_OP_CREDIT_UPDATE, NULL, 0);
+            } else if (op == VIRTIO_VSOCK_OP_CREDIT_UPDATE) {
+                /* peer credit already refreshed above; pending data is flushed below */
             } else if (op == VIRTIO_VSOCK_OP_SHUTDOWN || op == VIRTIO_VSOCK_OP_RST) {
                 fprintf(stderr, "[VSOCK-DEVICE] Guest SHUTDOWN/RST (op=%u)\n", op);
                 vsock->connected = false;
                 vsock->rx_fwd_cnt = 0;
+                vsock->tx_cnt = 0;
+                vsock->peer_fwd_cnt = 0;
+                vsock->credit_requested = false;
                 vsock->rx_buf_len = 0;
                 vsock->rx_buf_offset = 0;
+            }
+
+            /* The guest may have freed receive space: release data held back for credit. */
+            if (vsock->connected && vsock->rx_buf_offset < vsock->rx_buf_len &&
+                op != VIRTIO_VSOCK_OP_REQUEST) {
+                flush_rx(vsock);
             }
         }
 
@@ -253,6 +307,9 @@ static void chr_event(void *opaque, QEMUChrEvent event)
             vsock->connected = false;
         }
         vsock->rx_fwd_cnt = 0;
+        vsock->tx_cnt = 0;
+        vsock->peer_fwd_cnt = 0;
+        vsock->credit_requested = false;
         vsock->rx_buf_len = 0;
         vsock->rx_buf_offset = 0;
         break;
