@@ -2,6 +2,7 @@
 /build/
 /.cache/
 /.vscode/
+/build-min/
 *.pyc
 .sdk
 .stgit-*
