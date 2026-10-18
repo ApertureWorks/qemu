@@ -114,7 +114,9 @@ static void virtio_gpu_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
 
     g->req_state[idx].x = info->xoff;
     g->req_state[idx].y = info->yoff;
-    g->req_state[idx].refresh_rate = info->refresh_rate;
+    /* a UI that reports no rate must not erase the configured one */
+    g->req_state[idx].refresh_rate = info->refresh_rate ?
+        info->refresh_rate : g->conf.refresh_rate * 1000;
     g->req_state[idx].width = info->width;
     g->req_state[idx].height = info->height;
     g->req_state[idx].width_mm = info->width_mm;
@@ -201,11 +203,19 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
         return false;
     }
 
+    if (g->conf.refresh_rate > 1000) {
+        error_setg(errp, "invalid refresh_rate %u (must be 0..1000 Hz)",
+                   g->conf.refresh_rate);
+        return false;
+    }
+
     g->enabled_output_bitmask = (g->conf.max_outputs >= 32) ? 0xFFFFFFFF : ((1U << g->conf.max_outputs) - 1);
 
     for (i = 0; i < g->conf.max_outputs; i++) {
         g->req_state[i].width = g->conf.xres ? g->conf.xres : 1280;
         g->req_state[i].height = g->conf.yres ? g->conf.yres : 800;
+        /* qemu_edid_info.refresh_rate is in mHz; 0 selects the EDID default */
+        g->req_state[i].refresh_rate = g->conf.refresh_rate * 1000;
     }
 
     for (output_idx = 0, node = g->conf.outputs;
