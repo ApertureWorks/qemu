@@ -31,6 +31,7 @@
 
 #include "ui/egl-helpers.h"
 
+#include "system/hvf.h"
 #include <virglrenderer.h>
 
 /*
@@ -57,6 +58,10 @@ struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
     MemoryRegion *mr;
     void *map_fixed;
+    /* macOS/HVF with a 4 KB IPA granule: the resource's own host memory is mapped straight into
+     * the guest at hvf_gpa, with no copy and no remap through the BAR window. */
+    uint64_t hvf_gpa;
+    uint64_t hvf_size;
 };
 
 static struct virtio_gpu_virgl_resource *
@@ -263,6 +268,29 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
     }
 #endif
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (gl->hostmem_mmap && hvf_ipa_granule_is_4k()) {
+        /* 4 KB stage-2 granule: map the resource's host memory directly at the 4 KB-granular
+         * BAR address the guest chose. Neighbouring blobs can share no host page, so nothing
+         * can clobber another resource's mapping. */
+        hwaddr bar_base = b->hostmem.addr;
+        uint64_t gpa = bar_base + offset;
+        uint64_t map_size = QEMU_ALIGN_UP(size, 4096);
+
+        hv_vm_unmap(gpa, map_size);
+        hv_return_t hv_ret = hv_vm_map(data, gpa, map_size,
+                                       HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+        fprintf(stderr, "[VIRGL-HVF-DIRECT-MAP] res_id=%u gpa=0x%llx size=0x%llx host=%p ret=%d\n",
+                res->base.resource_id, (unsigned long long)gpa, (unsigned long long)map_size, data, hv_ret);
+        if (hv_ret != HV_SUCCESS) {
+            return -EINVAL;
+        }
+        res->hvf_gpa = gpa;
+        res->hvf_size = map_size;
+        return 0;
+    }
+#endif
+
     if (gl->hostmem_mmap) {
         vm_address_t target = (vm_address_t)(gl->hostmem_mmap + offset);
         vm_prot_t cur_prot, max_prot;
@@ -314,6 +342,19 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
 
 #ifdef __APPLE__
+#if defined(__aarch64__)
+    if (res->hvf_size && gl->hostmem_mmap) {
+        /* directly mapped (4 KB granule): drop the mapping and put the zero placeholder back */
+        hwaddr bar_base = b->hostmem.addr;
+        void *placeholder = (void *)((uintptr_t)gl->hostmem_mmap + (res->hvf_gpa - bar_base));
+        hv_vm_unmap(res->hvf_gpa, res->hvf_size);
+        hv_vm_map(placeholder, res->hvf_gpa, res->hvf_size,
+                  HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+        res->hvf_gpa = 0;
+        res->hvf_size = 0;
+        return 0;
+    }
+#endif
     if (res->map_fixed && gl->hostmem_mmap) {
         mmap(res->map_fixed, res->base.blob_size, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);

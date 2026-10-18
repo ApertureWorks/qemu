@@ -1345,6 +1345,16 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
         }
     }
 
+    if (__builtin_available(macOS 26.0, *)) {
+        /* The guest kernel uses 4 KB pages and allocates host-visible blobs in the virtio-gpu BAR
+         * at 4 KB granularity, while HVF's default stage-2 granule is the host's 16 KB. With a
+         * 16 KB granule two neighbouring blobs share a page and cannot both be mapped correctly. */
+        if (!getenv("APERTURE_HVF_IPA_GRANULE_16K") &&
+            hv_vm_config_set_ipa_granule(config, HV_IPA_GRANULE_4KB) == HV_SUCCESS) {
+            hvf_ipa_granule_4k = true;
+        }
+    }
+
     ret = hv_vm_create(config);
     if (hvf_irqchip_in_kernel()) {
         if (__builtin_available(macOS 15.0, *)) {

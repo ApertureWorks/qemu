@@ -12,6 +12,7 @@
 bool hvf_allowed;
 bool hvf_kernel_irqchip;
 bool hvf_nested_virt;
+bool hvf_ipa_granule_4k;
 
 void hvf_nested_virt_enable(bool nested_virt)
 {

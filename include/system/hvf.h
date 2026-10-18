@@ -30,10 +30,13 @@ extern bool hvf_kernel_irqchip;
 #define hvf_irqchip_in_kernel()  (hvf_kernel_irqchip)
 extern bool hvf_nested_virt;
 #define hvf_nested_virt_enabled()  (hvf_nested_virt)
+extern bool hvf_ipa_granule_4k;
+#define hvf_ipa_granule_is_4k()  (hvf_ipa_granule_4k)
 #else /* !CONFIG_HVF_IS_POSSIBLE */
 #define hvf_enabled() 0
 #define hvf_irqchip_in_kernel() 0
 #define hvf_nested_virt_enabled() 0
+#define hvf_ipa_granule_is_4k() 0
 #endif /* !CONFIG_HVF_IS_POSSIBLE */
 
 void hvf_nested_virt_enable(bool nested_virt);

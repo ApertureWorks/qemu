@@ -25,6 +25,9 @@
 bool hvf_allowed;
 bool hvf_kernel_irqchip;
 bool hvf_nested_virt;
+/* True when the VM was created with a 4 KB stage-2 (IPA) granule: hv_vm_map then works at 4 KB
+ * granularity, matching the 4 KB-page guest's host-visible BAR allocations. */
+bool hvf_ipa_granule_4k;
 static bool hvf_kernel_irqchip_override;
 
 void hvf_nested_virt_enable(bool nested_virt)
