@@ -20,6 +20,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <stdint.h>
+#include <poll.h>
+#include <pthread.h>
+#include <time.h>
 
 /* Maximum allowed single blob allocation size (1TB sanity limit) */
 #define MAX_BLOB_SIZE (1ULL << 40)
@@ -32,6 +35,13 @@
  *   [0x02][4B resource_id]                  - GPUResourceDestroyed (QEMU -> Host)
  *   [0x03][4B resource_id]                  - CMD_TRANSFER_RESOURCE (Host -> QEMU)
  *   [0x04][4B resource_id]                  - CMD_TRANSFER_DONE     (QEMU -> Host)
+ *   [0x05][4B scanout][4B iosurface][4B w][4B h]               - GPUScanoutFlushed (QEMU -> Host)
+ *   [0x06][... same as 0x05 ...][4B seq][8B ns]                - GPUScanoutFlushedV2 (QEMU -> Host)
+ *   [0x07]                                                      - HostHello (Host -> QEMU)
+ *
+ * 0x06 is only sent after the host sent 0x07 on this connection, so a host that predates it never sees
+ * it, and a QEMU that predates 0x07 ignores it (any header byte other than 0x03 is ignored).
+ * See Desktop/docs/wire_protocol.md.
  */
 static const char *aperture_gpu_sock_path(void)
 {
@@ -45,6 +55,19 @@ static const char *aperture_gpu_sock_path(void)
 #include <stdatomic.h>
 
 static int s_gpu_sock_fd = -1;
+
+/*
+ * Every writer to gpu.sock holds s_gpu_sock_tx_lock for a whole packet, so packets from different
+ * threads never interleave, and a packet is either written completely or not at all (see
+ * gpu_sock_send_locked).
+ */
+static pthread_mutex_t s_gpu_sock_tx_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The host sent 0x07 on the current connection: it understands 0x06. */
+static _Atomic bool s_host_v2;
+/* Last 0x06 sequence number issued per scanout head. */
+static _Atomic uint32_t s_flush_seq[VIRTIO_GPU_MAX_SCANOUTS];
+/* Scanout flushes dropped because the socket buffer was full (host not reading). */
+static _Atomic uint64_t s_flush_dropped;
 static VirtIOGPU *s_gpu_device = NULL;
 static QEMUTimer *s_gpu_sock_timer = NULL;
 
@@ -101,6 +124,7 @@ static void audit_hostmem_surface(IOSurfaceRef surface, uint32_t res_id, uint32_
 
 static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_resource *res);
 static int gpu_sock_ensure_connected(void);
+static bool gpu_sock_send(const uint8_t *buf, size_t len);
 
 static void gpu_sock_timer_cb(void *opaque)
 {
@@ -129,8 +153,7 @@ static void gpu_sock_timer_cb(void *opaque)
             buf[6] = (pn->iosurface_id >> 16) & 0xFF;
             buf[7] = (pn->iosurface_id >>  8) & 0xFF;
             buf[8] = (pn->iosurface_id       ) & 0xFF;
-            ssize_t n = send(s_gpu_sock_fd, buf, sizeof(buf), MSG_DONTWAIT);
-            if (n <= 0) { break; } /* will retry next timer fire or BH */
+            if (!gpu_sock_send(buf, sizeof(buf))) { break; } /* will retry next timer fire or BH */
             tail++;
             atomic_store_explicit(&s_notify_tail, tail, memory_order_release);
         }
@@ -184,6 +207,7 @@ static void gpu_sock_disconnect(const char *reason)
         close(s_gpu_sock_fd);
         s_gpu_sock_fd = -1;
     }
+    atomic_store(&s_host_v2, false);
     gpu_sock_schedule_reconnect();
 }
 
@@ -248,6 +272,12 @@ static void gpu_sock_read_cb(void *opaque)
         return;
     }
 
+    if (header == 0x07) {
+        /* HostHello: no payload. The host understands 0x06 (scanout flush with sequence + timestamp). */
+        atomic_store(&s_host_v2, true);
+        return;
+    }
+
     if (header == 0x03) {
         /* CMD_TRANSFER_RESOURCE: 4 bytes big-endian resource_id */
         uint8_t res_buf[4];
@@ -307,17 +337,7 @@ static void gpu_sock_read_cb(void *opaque)
         ack[3] = res_buf[2];
         ack[4] = res_buf[3];
 
-        size_t sent = 0;
-        while (sent < sizeof(ack) && s_gpu_sock_fd >= 0) {
-            ssize_t s = send(s_gpu_sock_fd, ack + sent, sizeof(ack) - sent, MSG_DONTWAIT);
-            if (s <= 0) {
-                if (s < 0 && (errno == EPIPE || errno == ECONNRESET)) {
-                    gpu_sock_disconnect("send error on ACK (EPIPE/ECONNRESET)");
-                }
-                break;
-            }
-            sent += (size_t)s;
-        }
+        gpu_sock_send(ack, sizeof(ack));
     }
 }
 
@@ -378,24 +398,70 @@ static int gpu_sock_ensure_connected(void)
     return s_gpu_sock_fd;
 }
 
-static void gpu_sock_send(const uint8_t *buf, size_t len)
+/*
+ * Writes all of buf, or none of it. Caller holds s_gpu_sock_tx_lock.
+ *
+ * - Nothing written yet and the socket buffer is full: a droppable packet (scanout flush) is dropped and
+ *   counted, anything else waits (bounded).
+ * - Part of the packet written: the rest is waited for (bounded). If the host still does not drain, the
+ *   connection is dropped, because leaving half a packet in the stream would desync the host decoder.
+ */
+static bool gpu_sock_send_locked(const uint8_t *buf, size_t len, bool may_drop)
 {
     int fd = gpu_sock_ensure_connected();
     if (fd < 0) {
-        return;
+        return false;
     }
 
     size_t sent = 0;
-    while (sent < len && s_gpu_sock_fd >= 0) {
-        ssize_t n = send(fd, buf + sent, len - sent, MSG_DONTWAIT);
-        if (n <= 0) {
-            if (n < 0 && (errno == EPIPE || errno == ECONNRESET)) {
-                gpu_sock_disconnect("send error on notify (EPIPE/ECONNRESET)");
-            }
-            break;
+    int waited_ms = 0;
+    while (sent < len) {
+        if (s_gpu_sock_fd < 0) {
+            return false;
         }
-        sent += (size_t)n;
+        ssize_t n = send(fd, buf + sent, len - sent, MSG_DONTWAIT);
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (sent == 0 && may_drop) {
+                uint64_t drops = atomic_fetch_add(&s_flush_dropped, 1) + 1;
+                if (drops == 1 || drops % 1000 == 0) {
+                    fprintf(stderr, "[QEMU-HOSTMEM-SOCK] gpu.sock full: dropped %llu scanout flush(es) so far\n",
+                            (unsigned long long)drops);
+                }
+                return false;
+            }
+            if (waited_ms >= 200) {
+                gpu_sock_disconnect("gpu.sock stalled with a packet half written");
+                return false;
+            }
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+            poll(&pfd, 1, 20);
+            waited_ms += 20;
+            continue;
+        }
+        if (n < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+            gpu_sock_disconnect("send error on notify (EPIPE/ECONNRESET)");
+        } else {
+            gpu_sock_disconnect("send error on notify");
+        }
+        return false;
     }
+    return true;
+}
+
+/* Must-deliver packet (resource lifecycle, transfer ack). */
+static bool gpu_sock_send(const uint8_t *buf, size_t len)
+{
+    pthread_mutex_lock(&s_gpu_sock_tx_lock);
+    bool ok = gpu_sock_send_locked(buf, len, false);
+    pthread_mutex_unlock(&s_gpu_sock_tx_lock);
+    return ok;
 }
 
 static _Atomic uint32_t s_res_to_iosurf[8192];
@@ -498,32 +564,50 @@ void virtio_gpu_hostmem_notify_destroyed(uint32_t resource_id)
     gpu_sock_send(buf, sizeof(buf));
 }
 
+static void put_be32(uint8_t *p, uint32_t v)
+{
+    p[0] = (v >> 24) & 0xFF;
+    p[1] = (v >> 16) & 0xFF;
+    p[2] = (v >>  8) & 0xFF;
+    p[3] = (v      ) & 0xFF;
+}
+
 __attribute__((visibility("default")))
 void virtio_gpu_hostmem_notify_scanout_flush(uint32_t scanout_id, uint32_t iosurface_id, uint32_t width, uint32_t height)
 {
+    /* The connection decides which packet to use, so make sure it exists before looking at s_host_v2. */
+    if (gpu_sock_ensure_connected() < 0) {
+        return;
+    }
+
+    if (atomic_load(&s_host_v2) && scanout_id < VIRTIO_GPU_MAX_SCANOUTS) {
+        /* 0x06: sequence and timestamp are taken under the tx lock so they are in wire order. */
+        uint8_t packet[29];
+        pthread_mutex_lock(&s_gpu_sock_tx_lock);
+        uint32_t seq = atomic_fetch_add(&s_flush_seq[scanout_id], 1) + 1;
+        uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        packet[0] = 0x06; /* GPUScanoutFlushedV2 */
+        put_be32(packet + 1, scanout_id);
+        put_be32(packet + 5, iosurface_id);
+        put_be32(packet + 9, width);
+        put_be32(packet + 13, height);
+        put_be32(packet + 17, seq);
+        put_be32(packet + 21, (uint32_t)(ns >> 32));
+        put_be32(packet + 25, (uint32_t)ns);
+        gpu_sock_send_locked(packet, sizeof(packet), true);
+        pthread_mutex_unlock(&s_gpu_sock_tx_lock);
+        return;
+    }
+
     uint8_t packet[17];
-    packet[0] = 0x05; // GPUScanoutFlushed Tag
-    packet[1]  = (scanout_id   >> 24) & 0xFF;
-    packet[2]  = (scanout_id   >> 16) & 0xFF;
-    packet[3]  = (scanout_id   >>  8) & 0xFF;
-    packet[4]  = (scanout_id        ) & 0xFF;
-
-    packet[5]  = (iosurface_id >> 24) & 0xFF;
-    packet[6]  = (iosurface_id >> 16) & 0xFF;
-    packet[7]  = (iosurface_id >>  8) & 0xFF;
-    packet[8]  = (iosurface_id      ) & 0xFF;
-
-    packet[9]  = (width        >> 24) & 0xFF;
-    packet[10] = (width        >> 16) & 0xFF;
-    packet[11] = (width        >>  8) & 0xFF;
-    packet[12] = (width             ) & 0xFF;
-
-    packet[13] = (height       >> 24) & 0xFF;
-    packet[14] = (height       >> 16) & 0xFF;
-    packet[15] = (height       >>  8) & 0xFF;
-    packet[16] = (height            ) & 0xFF;
-
-    gpu_sock_send(packet, sizeof(packet));
+    packet[0] = 0x05; /* GPUScanoutFlushed */
+    put_be32(packet + 1, scanout_id);
+    put_be32(packet + 5, iosurface_id);
+    put_be32(packet + 9, width);
+    put_be32(packet + 13, height);
+    pthread_mutex_lock(&s_gpu_sock_tx_lock);
+    gpu_sock_send_locked(packet, sizeof(packet), true);
+    pthread_mutex_unlock(&s_gpu_sock_tx_lock);
 }
 
 void *virtio_gpu_hostmem_get_iosurface(struct virtio_gpu_simple_resource *res)
