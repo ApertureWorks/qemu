@@ -601,6 +601,89 @@ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
     }
 }
 
+/*
+ * Host notification for a page flip.
+ *
+ * A guest page flip is SET_SCANOUT_BLOB(new fb) followed by RESOURCE_FLUSH(same fb). Notifying the host from both
+ * sent two packets per frame, the second a repeat of the first (measured live: 50 % of flush notifications repeated
+ * the previous one, and the two call sites fired once each per frame). The flush is the point where the frame is
+ * complete (for 2D guest-RAM resources it also performs the copy into the IOSurface), so SET_SCANOUT only ARMS a
+ * notification and the flush supersedes it. If no flush follows within APERTURE_DEFERRED_NOTIFY_NS the armed
+ * notification is sent anyway, so a scanout change that is not followed by a flush is never lost.
+ * All of this runs on the main loop thread (command processing and QEMU timers), so it needs no locking.
+ */
+#define APERTURE_DEFERRED_NOTIFY_NS (5 * 1000 * 1000)
+
+typedef struct ApertureDeferredNotify {
+    bool pending;
+    uint32_t resource_id;
+    uint32_t iosurf_id;
+    uint32_t width;
+    uint32_t height;
+} ApertureDeferredNotify;
+
+static ApertureDeferredNotify s_deferred[VIRTIO_GPU_MAX_SCANOUTS];
+static QEMUTimer *s_deferred_timer;
+static VirtIOGPU *s_deferred_gpu;
+
+static void aperture_deferred_notify_cb(void *opaque)
+{
+    VirtIOGPU *g = s_deferred_gpu;
+    uint32_t i;
+
+    for (i = 0; g && i < g->parent_obj.conf.max_outputs &&
+                i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
+        ApertureDeferredNotify *d = &s_deferred[i];
+        struct virtio_gpu_simple_resource *res;
+
+        if (!d->pending) {
+            continue;
+        }
+        d->pending = false;
+        /* the scanout was re-pointed or disabled meanwhile: nothing to announce */
+        if (g->parent_obj.scanout[i].resource_id != d->resource_id) {
+            continue;
+        }
+        res = virtio_gpu_find_resource(g, d->resource_id);
+        virtio_gpu_hostmem_sync_scanout(d->resource_id, res);
+        virtio_gpu_hostmem_notify_scanout_flush(i, d->iosurf_id, d->width, d->height);
+    }
+}
+
+static void G_GNUC_UNUSED aperture_defer_scanout_notify(VirtIOGPU *g, uint32_t scanout,
+                                          uint32_t resource_id, uint32_t iosurf_id,
+                                          uint32_t width, uint32_t height)
+{
+    ApertureDeferredNotify *d;
+
+    if (scanout >= VIRTIO_GPU_MAX_SCANOUTS) {
+        virtio_gpu_hostmem_notify_scanout_flush(scanout, iosurf_id, width, height);
+        return;
+    }
+    d = &s_deferred[scanout];
+    d->pending = true;
+    d->resource_id = resource_id;
+    d->iosurf_id = iosurf_id;
+    d->width = width;
+    d->height = height;
+    s_deferred_gpu = g;
+    if (!s_deferred_timer) {
+        s_deferred_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                        aperture_deferred_notify_cb, NULL);
+    }
+    if (!timer_pending(s_deferred_timer)) {
+        timer_mod(s_deferred_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + APERTURE_DEFERRED_NOTIFY_NS);
+    }
+}
+
+static void aperture_cancel_deferred_notify(uint32_t scanout)
+{
+    if (scanout < VIRTIO_GPU_MAX_SCANOUTS) {
+        s_deferred[scanout].pending = false;
+    }
+}
+
 static void virgl_cmd_resource_flush(VirtIOGPU *g,
                                      struct virtio_gpu_ctrl_command *cmd)
 {
@@ -637,6 +720,8 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
             fprintf(stderr, "[VIRGL-SCANOUT-FLUSH] scanout=%d res_id=%u iosurf_id=%u (%ux%u)\n",
                     i, rf.resource_id, iosurf_id, flush_w, flush_h);
 #endif
+            /* the flush supersedes a notification armed by SET_SCANOUT for this frame */
+            aperture_cancel_deferred_notify(i);
             virtio_gpu_hostmem_notify_scanout_flush(i, iosurf_id, flush_w, flush_h);
         }
     }
@@ -1164,6 +1249,7 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
     }
 
     if (ss.resource_id == 0) {
+        aperture_cancel_deferred_notify(ss.scanout_id);
         virtio_gpu_disable_scanout(g, ss.scanout_id);
         return;
     }
@@ -1228,8 +1314,9 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
     g->parent_obj.scanout[ss.scanout_id].y = ss.r.y;
 
     if (iosurf_id > 0) {
-        virtio_gpu_hostmem_sync_scanout(ss.resource_id, &res->base);
-        virtio_gpu_hostmem_notify_scanout_flush(ss.scanout_id, iosurf_id, ss.r.width, ss.r.height);
+        /* announced by the RESOURCE_FLUSH that follows; sent from a timer if none does */
+        aperture_defer_scanout_notify(g, ss.scanout_id, ss.resource_id, iosurf_id,
+                                      ss.r.width, ss.r.height);
     }
 #endif
 }
