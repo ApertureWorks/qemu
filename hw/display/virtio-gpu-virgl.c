@@ -1788,6 +1788,13 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
         error_report("virgl could not be initialized: %d", ret);
         return ret;
     }
+#ifdef __APPLE__
+    /* Declared here: QEMU builds against the installed virglrenderer.h, which predates this API */
+    extern void virgl_renderer_set_iosurface_lookup(uint32_t (*lookup)(uint32_t res_handle));
+    /* Let Venus re-find the host IOSurface behind a guest resource when another context
+     * imports it, so Vulkan wraps the memory the guest maps and the display path shows. */
+    virgl_renderer_set_iosurface_lookup(virtio_gpu_hostmem_lookup_iosurface_id);
+#endif
 
     gl->fence_poll = timer_new_ms(QEMU_CLOCK_REALTIME,
                                   virtio_gpu_fence_poll, g);
