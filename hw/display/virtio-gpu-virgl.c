@@ -1147,8 +1147,16 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
      * IOSurface ID directly via virtio_gpu_hostmem_notify_created(res_id, iosurf_id).
      * info.fd is a Unix SHM file descriptor, NOT an IOSurface ID.
      * Only create a fallback IOSurface if virglrenderer hasn't already registered one.
+     *
+     * Only for SHAREABLE blobs (gralloc/display buffers the host app consumes). A blob
+     * without SHAREABLE is Venus-internal shared memory (ring, reply buffers): the
+     * renderer thread reads the resource's own memory, so mapping the guest to a
+     * separate fallback IOSurface leaves the host thread blind to guest writes and the
+     * guest's vkCreateInstance aborts on the ring watchdog.
      */
-    if (res->base.blob_size > 0 && virtio_gpu_hostmem_lookup_iosurface_id(cblob.resource_id) == 0) {
+    if (res->base.blob_size > 0 &&
+        (cblob.blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE) &&
+        virtio_gpu_hostmem_lookup_iosurface_id(cblob.resource_id) == 0) {
         virtio_gpu_hostmem_create_resource(g, &res->base);
     }
 #endif
