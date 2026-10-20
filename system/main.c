@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <locale.h>
 #include "qemu-main.h"
 #include "qemu/main-loop.h"
 #include "system/replay.h"
@@ -68,6 +69,15 @@ int (*qemu_main)(void) = os_darwin_cfrunloop_main;
 
 int main(int argc, char **argv)
 {
+#ifdef CONFIG_DARWIN
+    /*
+     * With -display none nothing calls setlocale(), so the locale stays "C" and glib's charset is
+     * US-ASCII: every g_strerror() (libslirp reports failed UDP sends through it) then converts
+     * through iconv_open(), which crashed in Apple's _citrus_iconv_open (NULL deref) on the
+     * qemu_main thread. A UTF-8 charset makes glib skip the conversion.
+     */
+    setlocale(LC_CTYPE, "UTF-8");
+#endif
     qemu_init(argc, argv);
 
     /*
