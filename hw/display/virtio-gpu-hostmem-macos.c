@@ -64,6 +64,16 @@ static int s_gpu_sock_fd = -1;
 static pthread_mutex_t s_gpu_sock_tx_lock = PTHREAD_MUTEX_INITIALIZER;
 /* The host sent 0x07 on the current connection: it understands 0x06. */
 static _Atomic bool s_host_v2;
+/*
+ * Blob registry packets (0x08/0x0C), negotiated like 0x06/0x07: the host sends the one-byte HostHelloV2 (0x0A) and QEMU
+ * answers QemuCaps (0x0B, 2 bytes). Only then does QEMU send 0x08/0x0C, so an old host never sees them and an old QEMU
+ * ignores the 0x0A byte. Unlike the 0x01/0x02 packets (which Venus also emits, keyed by Venus object ids), these exist
+ * only for virtio-gpu blob resources and are keyed by the virtio resource id + a generation (ids are recycled).
+ */
+#define APERTURE_QEMU_CAP_BLOB_REGISTRY 0x01
+static _Atomic bool s_host_blob_registry;
+static _Atomic uint32_t s_blob_generation;       /* +1 per blob resource created */
+static uint32_t s_res_generation[8192];          /* written under the BQL / I/O thread only */
 /* Last 0x06 sequence number issued per scanout head. */
 static _Atomic uint32_t s_flush_seq[VIRTIO_GPU_MAX_SCANOUTS];
 /* Scanout flushes dropped because the socket buffer was full (host not reading). */
@@ -208,6 +218,7 @@ static void gpu_sock_disconnect(const char *reason)
         s_gpu_sock_fd = -1;
     }
     atomic_store(&s_host_v2, false);
+    atomic_store(&s_host_blob_registry, false);
     gpu_sock_schedule_reconnect();
 }
 
@@ -252,6 +263,50 @@ void virtio_gpu_hostmem_init_iothread(VirtIOGPU *g)
     fflush(stderr);
 }
 
+static void put_be32(uint8_t *p, uint32_t v);
+static bool gpu_sock_send(const uint8_t *buf, size_t len);
+
+/* 0x08 BlobRegistered: [0x08][res_id u32][iosurface_id u32][size u64][generation u32] (21 bytes, big endian) */
+static void blob_registry_send_registered(uint32_t res_id, uint32_t iosurface_id, uint64_t size, uint32_t generation)
+{
+    uint8_t p[21];
+    p[0] = 0x08;
+    put_be32(p + 1, res_id);
+    put_be32(p + 5, iosurface_id);
+    put_be32(p + 9, (uint32_t)(size >> 32));
+    put_be32(p + 13, (uint32_t)size);
+    put_be32(p + 17, generation);
+    gpu_sock_send(p, sizeof(p));
+}
+
+/* 0x0C BlobUnregistered: [0x0C][res_id u32][generation u32] (9 bytes) */
+static void blob_registry_send_unregistered(uint32_t res_id, uint32_t generation)
+{
+    uint8_t p[9];
+    p[0] = 0x0C;
+    put_be32(p + 1, res_id);
+    put_be32(p + 5, generation);
+    gpu_sock_send(p, sizeof(p));
+}
+
+/* A host that connects after resources exist (the normal case: the app starts after QEMU's first allocations) gets them all. */
+static void blob_registry_send_all(VirtIOGPU *g)
+{
+    struct virtio_gpu_simple_resource *res;
+
+    if (!g) {
+        return;
+    }
+    QTAILQ_FOREACH(res, &g->reslist, next) {
+        struct VirtIOGPUMacOSHostMem *hm = res->hostmem_priv;
+
+        if (hm && hm->surface && res->resource_id < 8192) {
+            blob_registry_send_registered(res->resource_id, hm->iosurface_id, res->blob_size,
+                                          s_res_generation[res->resource_id]);
+        }
+    }
+}
+
 static void gpu_sock_read_cb(void *opaque)
 {
     VirtIOGPU *g = (VirtIOGPU *)opaque;
@@ -275,6 +330,16 @@ static void gpu_sock_read_cb(void *opaque)
     if (header == 0x07) {
         /* HostHello: no payload. The host understands 0x06 (scanout flush with sequence + timestamp). */
         atomic_store(&s_host_v2, true);
+        return;
+    }
+
+    if (header == 0x0A) {
+        /* HostHelloV2, no payload: the host understands 0x08/0x0C. Answer with our capabilities, then replay the registry. */
+        uint8_t caps[2] = { 0x0B, APERTURE_QEMU_CAP_BLOB_REGISTRY };
+
+        gpu_sock_send(caps, sizeof(caps));
+        atomic_store(&s_host_blob_registry, true);
+        blob_registry_send_all(g ? g : s_gpu_device);
         return;
     }
 
@@ -961,6 +1026,13 @@ static int macos_hostmem_create_resource(VirtIOGPU *g, struct virtio_gpu_simple_
 
     /* Notify Aperture host that this IOSurface is now associated with resource_id. */
     virtio_gpu_hostmem_notify_created(res->resource_id, hm->iosurface_id);
+    if (res->resource_id < 8192) {
+        s_res_generation[res->resource_id] = atomic_fetch_add(&s_blob_generation, 1) + 1;
+        if (atomic_load(&s_host_blob_registry)) {
+            blob_registry_send_registered(res->resource_id, hm->iosurface_id, res->blob_size,
+                                          s_res_generation[res->resource_id]);
+        }
+    }
 
     /* Lock CPU mapping for host RAM access */
     int ret = macos_hostmem_map_resource(g, res);
@@ -984,6 +1056,9 @@ static void macos_hostmem_destroy_resource(VirtIOGPU *g, struct virtio_gpu_simpl
 
     /* Notify Aperture before releasing the surface so host can stop sampling it. */
     virtio_gpu_hostmem_notify_destroyed(res->resource_id);
+    if (res->resource_id < 8192 && atomic_load(&s_host_blob_registry)) {
+        blob_registry_send_unregistered(res->resource_id, s_res_generation[res->resource_id]);
+    }
 
     res->hostmem_priv = NULL;
 
