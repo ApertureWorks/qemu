@@ -33,6 +33,7 @@
 
 #include "system/hvf.h"
 #include <virglrenderer.h>
+#include "virtio-gpu-fence-gate.h"
 
 /*
  * VIRGL_CHECK_VERSION available since libvirglrenderer 1.0.1 and was fixed
@@ -1478,6 +1479,11 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
     if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX) {
         const uint32_t flags = VIRGL_RENDERER_FENCE_FLAG_MERGEABLE;
 
+        /* Aperture ring-fence gate: a gated ring's fence stays on the fence queue until the host credits it (off by default). */
+        if (virtio_gpu_fence_gate_hold(g, cmd)) {
+            return;
+        }
+
         ret = virgl_renderer_context_create_fence(cmd->cmd_hdr.ctx_id, flags,
                                                   cmd->cmd_hdr.ring_idx,
                                                   cmd->cmd_hdr.fence_id);
@@ -1865,6 +1871,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
     fprintf(stderr, "[VIRGL-INIT] Calling virtio_gpu_hostmem_init_iothread (I/O thread)\n");
     fflush(stderr);
     virtio_gpu_hostmem_init_iothread(g);
+    virtio_gpu_fence_gate_attach(g);
     fprintf(stderr, "[VIRGL-INIT] virtio_gpu_hostmem_init_iothread returned\n");
     fflush(stderr);
 #endif

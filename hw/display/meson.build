@@ -68,7 +68,7 @@ system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.
 if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   virtio_gpu_ss = ss.source_set()
   virtio_gpu_ss.add(when: 'CONFIG_VIRTIO_GPU',
-                    if_true: [files('virtio-gpu-base.c', 'virtio-gpu.c', 'virtio-gpu-hostmem.c'), pixman])
+                    if_true: [files('virtio-gpu-base.c', 'virtio-gpu.c', 'virtio-gpu-hostmem.c', 'virtio-gpu-fence-gate.c', 'virtio-gpu-fence-gate-core.c'), pixman])
   if host_os == 'linux'
     virtio_gpu_ss.add(files('virtio-gpu-udmabuf.c', 'virtio-gpu-hostmem-linux.c'))
   else

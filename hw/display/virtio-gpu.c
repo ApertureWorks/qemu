@@ -33,6 +33,7 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "virtio-gpu-fence-gate.h"
 
 #define VIRTIO_GPU_VM_VERSION 1
 
@@ -1793,6 +1794,8 @@ void virtio_gpu_reset(VirtIODevice *vdev)
         g_free(cmd);
     }
 
+    /* commands held by the Aperture ring-fence gate live on fenceq: forget them before the queue is freed */
+    virtio_gpu_fence_gate_device_reset();
     while (!QTAILQ_EMPTY(&g->fenceq)) {
         cmd = QTAILQ_FIRST(&g->fenceq);
         QTAILQ_REMOVE(&g->fenceq, cmd, next);

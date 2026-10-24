@@ -53,6 +53,7 @@ static const char *aperture_gpu_sock_path(void)
 }
 
 #include <stdatomic.h>
+#include "virtio-gpu-fence-gate.h"
 
 static int s_gpu_sock_fd = -1;
 
@@ -71,6 +72,8 @@ static _Atomic bool s_host_v2;
  * only for virtio-gpu blob resources and are keyed by the virtio resource id + a generation (ids are recycled).
  */
 #define APERTURE_QEMU_CAP_BLOB_REGISTRY 0x01
+/* QemuCaps bit 1: the ring-fence gate (0x0D-0x10, virtio-gpu-fence-gate.c) exists. It stays off until the host sends GateConfig. */
+#define APERTURE_QEMU_CAP_RELEASE_GATE 0x02
 static _Atomic bool s_host_blob_registry;
 static _Atomic uint32_t s_blob_generation;       /* +1 per blob resource created */
 static uint32_t s_res_generation[8192];          /* written under the BQL / I/O thread only */
@@ -212,6 +215,7 @@ static void gpu_sock_disconnect(const char *reason)
 {
     fprintf(stderr, "[QEMU-HOSTMEM-SOCK] 🔌 gpu_sock_disconnect called (fd=%d, reason='%s')\n", s_gpu_sock_fd, reason ? reason : "unknown");
     fflush(stderr);
+    virtio_gpu_fence_gate_host_gone();
     if (s_gpu_sock_fd >= 0) {
         qemu_set_fd_handler(s_gpu_sock_fd, NULL, NULL, NULL);
         close(s_gpu_sock_fd);
@@ -335,12 +339,39 @@ static void gpu_sock_read_cb(void *opaque)
 
     if (header == 0x0A) {
         /* HostHelloV2, no payload: the host understands 0x08/0x0C. Answer with our capabilities, then replay the registry. */
-        uint8_t caps[2] = { 0x0B, APERTURE_QEMU_CAP_BLOB_REGISTRY };
+        uint8_t caps[2] = { 0x0B, APERTURE_QEMU_CAP_BLOB_REGISTRY | APERTURE_QEMU_CAP_RELEASE_GATE };
 
         gpu_sock_send(caps, sizeof(caps));
         atomic_store(&s_host_blob_registry, true);
         blob_registry_send_all(g ? g : s_gpu_device);
         return;
+    }
+
+    {
+        int gate_len = virtio_gpu_fence_gate_payload_len(header);
+
+        if (gate_len > 0) {
+            /* Ring-fence gate packet (host -> QEMU): consume the payload first so the stream stays in sync whatever happens next. */
+            uint8_t payload[8], reply[4];
+            size_t got = 0;
+
+            while (got < (size_t)gate_len) {
+                ssize_t r = recv(s_gpu_sock_fd, payload + got, (size_t)gate_len - got, 0);
+                if (r <= 0) {
+                    gpu_sock_disconnect("recv error reading gate payload");
+                    return;
+                }
+                got += (size_t)r;
+            }
+            if (atomic_load(&s_host_blob_registry)) { /* only after the 0x0A/0x0B handshake */
+                size_t n = virtio_gpu_fence_gate_handle(header, payload, reply);
+
+                if (n) {
+                    gpu_sock_send(reply, n);
+                }
+            }
+            return;
+        }
     }
 
     if (header == 0x03) {

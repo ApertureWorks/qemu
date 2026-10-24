@@ -131,6 +131,7 @@ if have_system
     'test-opts-visitor': [testqapi],
     'test-xs-node': [qom],
     'test-virtio-dmabuf': [meson.project_source_root() / 'hw/display/virtio-dmabuf.c'],
+    'test-virtio-gpu-fence-gate': [meson.project_source_root() / 'hw/display/virtio-gpu-fence-gate-core.c'],
     'test-qmp-cmds': [testqapi],
     'test-xbzrle': [migration],
     'test-util-sockets': ['socket-helpers.c'],
