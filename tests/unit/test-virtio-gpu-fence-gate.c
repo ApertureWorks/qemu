@@ -183,6 +183,25 @@ static void test_no_fence_outlives_the_timeout(void)
     }
 }
 
+static void test_open_all_fails_open_until_reset(void)
+{
+    FenceGate g;
+    Log l;
+
+    setup(&g, &l);
+    fence_gate_configure(&g, 32, 16, 100);
+    fence_gate_reset(&g, RING, 1);
+    fence_gate_hold(&g, RING, id(1), 0);
+    fence_gate_open_all(&g);
+    g_assert_cmpint(l.n, ==, 1);
+    g_assert_true(fence_gate_hold(&g, RING, id(2), 0)); /* still claimed, retired at once */
+    g_assert_cmpint(l.n, ==, 2);
+    g_assert_cmpuint(fence_gate_held_count(&g, RING), ==, 0);
+    fence_gate_reset(&g, RING, 2); /* a new session restores normal holding */
+    fence_gate_hold(&g, RING, id(3), 0);
+    g_assert_cmpint(l.n, ==, 2);
+}
+
 static void test_drop_all_does_not_call_retire(void)
 {
     FenceGate g;
@@ -208,6 +227,7 @@ int main(int argc, char **argv)
     g_test_add_func("/virtio-gpu/fence-gate/reset", test_reset_retires_all_and_restarts_the_count);
     g_test_add_func("/virtio-gpu/fence-gate/timeout", test_timeout_retires_and_reports_the_next_deadline);
     g_test_add_func("/virtio-gpu/fence-gate/bounded-hold", test_no_fence_outlives_the_timeout);
+    g_test_add_func("/virtio-gpu/fence-gate/open-all", test_open_all_fails_open_until_reset);
     g_test_add_func("/virtio-gpu/fence-gate/drop-all", test_drop_all_does_not_call_retire);
     return g_test_run();
 }

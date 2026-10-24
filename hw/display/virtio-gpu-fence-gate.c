@@ -84,14 +84,12 @@ void virtio_gpu_fence_gate_host_gone(void)
     if (!s_inited || !s_gate.enabled) {
         return;
     }
-    for (uint32_t i = 0; i < s_gate.ring_count; i++) {
-        fence_gate_reset(&s_gate, s_gate.base_ring + i, 0);
-    }
-    s_gate.enabled = false;
+    /* Fail open: a fence on a gated ring would otherwise never signal (no Venus consumer serves those rings). */
+    fence_gate_open_all(&s_gate);
     if (s_timer) {
         timer_del(s_timer);
     }
-    fprintf(stderr, "[QEMU-FENCE-GATE] host gone: gate released and disabled\n");
+    fprintf(stderr, "[QEMU-FENCE-GATE] host gone: held fences released, gated rings now signal at once\n");
 }
 
 int virtio_gpu_fence_gate_payload_len(uint8_t tag)

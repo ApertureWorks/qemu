@@ -55,6 +55,11 @@ unsigned fence_gate_release_up_to(FenceGate *g, uint32_t ring, uint16_t epoch, u
 unsigned fence_gate_reset(FenceGate *g, uint32_t ring, uint16_t epoch);
 /* Retires held commands older than the timeout. Returns the absolute deadline (ms) of the oldest remaining one, or -1. */
 int64_t fence_gate_expire(FenceGate *g, int64_t now_ms);
+/*
+ * Fail open: retires everything held and credits every future fence at once (until the next reset). Used when the host
+ * is gone, so guest fences on gated rings keep signalling instead of hanging forever.
+ */
+void fence_gate_open_all(FenceGate *g);
 /* Forgets every held command without retiring it (the owner is freeing them, e.g. device reset). */
 void fence_gate_drop_all(FenceGate *g);
 unsigned fence_gate_held_count(const FenceGate *g, uint32_t ring);

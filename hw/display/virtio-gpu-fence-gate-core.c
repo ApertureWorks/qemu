@@ -146,6 +146,16 @@ int64_t fence_gate_expire(FenceGate *g, int64_t now_ms)
     return next;
 }
 
+void fence_gate_open_all(FenceGate *g)
+{
+    for (int i = 0; i < g->ring_count; i++) {
+        FenceGateRing *r = &g->rings[i];
+
+        retire_upto(g, r, UINT32_MAX, &g->stats.reset);
+        r->credit = UINT32_MAX;
+    }
+}
+
 void fence_gate_drop_all(FenceGate *g)
 {
     for (int i = 0; i < FENCE_GATE_MAX_RINGS; i++) {
