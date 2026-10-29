@@ -65,6 +65,7 @@ virtio_gpu_base_generate_edid(VirtIOGPUBase *g, int scanout,
         .prefx = g->req_state[scanout].width,
         .prefy = g->req_state[scanout].height,
         .refresh_rate = g->req_state[scanout].refresh_rate,
+        .refresh_divisors = g->conf.refresh_divisors,
     };
 
     for (output_idx = 0, node = g->conf.outputs;

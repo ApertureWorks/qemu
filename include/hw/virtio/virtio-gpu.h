@@ -137,6 +137,8 @@ struct virtio_gpu_base_conf {
     uint32_t xres;
     /* Refresh rate (Hz) advertised in every output's EDID; 0 keeps the EDID default (75 Hz). */
     uint32_t refresh_rate;
+    /* Bit k set: the EDID also lists the preferred mode at refresh_rate / k (guest-visible lower refresh rates); 0 = off. */
+    uint32_t refresh_divisors;
     uint32_t yres;
     uint64_t hostmem;
     VirtIOGPUOutputList *outputs;
@@ -184,7 +186,8 @@ struct VirtIOGPUBaseClass {
                     VIRTIO_GPU_FLAG_EDID_ENABLED, true), \
     DEFINE_PROP_UINT32("xres", _state, _conf.xres, 1280), \
     DEFINE_PROP_UINT32("yres", _state, _conf.yres, 800), \
-    DEFINE_PROP_UINT32("refresh_rate", _state, _conf.refresh_rate, 0)
+    DEFINE_PROP_UINT32("refresh_rate", _state, _conf.refresh_rate, 0), \
+    DEFINE_PROP_UINT32("refresh_divisors", _state, _conf.refresh_divisors, 0)
 
 typedef struct VGPUDMABuf {
     QemuDmaBuf *buf;

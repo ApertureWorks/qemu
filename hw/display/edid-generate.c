@@ -346,34 +346,56 @@ static void init_displayid(uint8_t *did)
     edid_checksum(did + 1, did[2] + 4);
 }
 
+static void displayid_timing(uint8_t *t, const Timings *timings, uint32_t xres,
+                             uint32_t yres, bool preferred)
+{
+    t[0] = timings->clock  & 0xff;
+    t[1] = (timings->clock & 0xff00) >> 8;
+    t[2] = (timings->clock & 0xff0000) >> 16;
+
+    t[3] = preferred ? 0x88 : 0x08; /* leave aspect ratio undefined; bit 7 = preferred */
+
+    stw_le_p(t + 4, 0xffff & (xres - 1));
+    stw_le_p(t + 6, 0xffff & (timings->xblank - 1));
+    stw_le_p(t + 8, 0xffff & (timings->xfront - 1));
+    stw_le_p(t + 10, 0xffff & (timings->xsync - 1));
+
+    stw_le_p(t + 12, 0xffff & (yres - 1));
+    stw_le_p(t + 14, 0xffff & (timings->yblank - 1));
+    stw_le_p(t + 16, 0xffff & (timings->yfront - 1));
+    stw_le_p(t + 18, 0xffff & (timings->ysync - 1));
+}
+
+/*
+ * One DisplayID Detailed Timings block: the preferred timing, then (divisors bitmask, bit k = refresh_rate / k) the same
+ * resolution at lower refresh rates so a guest can pick them like display modes (variable refresh by mode switch).
+ */
 static void qemu_displayid_generate(uint8_t *did, const Timings *timings,
                                     uint32_t xres, uint32_t yres,
-                                    uint32_t xmm, uint32_t ymm)
+                                    uint32_t refresh_rate, uint32_t divisors)
 {
+    uint32_t n = 1, k;
+
     did[0] = 0x70; /* display id extension */
     did[1] = 0x13; /* version 1.3 */
-    did[2] = 23;   /* length */
     did[3] = 0x03; /* product type (0x03 == standalone display device) */
 
     did[5] = 0x03; /* Detailed Timings Data Block */
     did[6] = 0x00; /* revision */
-    did[7] = 0x14; /* block length */
 
-    did[8]  = timings->clock  & 0xff;
-    did[9]  = (timings->clock & 0xff00) >> 8;
-    did[10] = (timings->clock & 0xff0000) >> 16;
+    displayid_timing(did + 8, timings, xres, yres, true);
+    for (k = 2; k < 8 && n < 5; k++) {
+        Timings t;
 
-    did[11] = 0x88; /* leave aspect ratio undefined */
-
-    stw_le_p(did + 12, 0xffff & (xres - 1));
-    stw_le_p(did + 14, 0xffff & (timings->xblank - 1));
-    stw_le_p(did + 16, 0xffff & (timings->xfront - 1));
-    stw_le_p(did + 18, 0xffff & (timings->xsync - 1));
-
-    stw_le_p(did + 20, 0xffff & (yres - 1));
-    stw_le_p(did + 22, 0xffff & (timings->yblank - 1));
-    stw_le_p(did + 24, 0xffff & (timings->yfront - 1));
-    stw_le_p(did + 26, 0xffff & (timings->ysync - 1));
+        if (!(divisors & (1u << k))) {
+            continue;
+        }
+        generate_timings(&t, refresh_rate / k, xres, yres);
+        displayid_timing(did + 8 + 20 * n, &t, xres, yres, false);
+        n++;
+    }
+    did[7] = 20 * n;   /* block length */
+    did[2] = 3 + 20 * n; /* section length (block header + payload) */
 
     edid_checksum(did + 1, did[2] + 4);
 }
@@ -535,7 +557,7 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
 
     if (did && large_screen) {
         qemu_displayid_generate(did, &timings, info->prefx, info->prefy,
-                                width_mm, height_mm);
+                                refresh_rate, info->refresh_divisors);
     }
 
     /* =============== finish up =============== */
