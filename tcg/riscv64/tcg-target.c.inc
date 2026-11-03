@@ -299,13 +299,9 @@ typedef enum {
     OPC_VSSUBU_VI = 0x88000057 | V_OPIVI,
 
     OPC_VMAX_VV = 0x1c000057 | V_OPIVV,
-    OPC_VMAX_VI = 0x1c000057 | V_OPIVI,
     OPC_VMAXU_VV = 0x18000057 | V_OPIVV,
-    OPC_VMAXU_VI = 0x18000057 | V_OPIVI,
     OPC_VMIN_VV = 0x14000057 | V_OPIVV,
-    OPC_VMIN_VI = 0x14000057 | V_OPIVI,
     OPC_VMINU_VV = 0x10000057 | V_OPIVV,
-    OPC_VMINU_VI = 0x10000057 | V_OPIVI,
 
     OPC_VMSEQ_VV = 0x60000057 | V_OPIVV,
     OPC_VMSEQ_VI = 0x60000057 | V_OPIVI,
@@ -768,6 +764,7 @@ static bool tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg)
     case TCG_TYPE_V64:
     case TCG_TYPE_V128:
     case TCG_TYPE_V256:
+        tcg_debug_assert(s->riscv_cur_type != TCG_TYPE_COUNT);
         {
             int lmul = type - riscv_lg2_vlenb;
             int nf = 1 << MAX(lmul, 0);
@@ -1007,6 +1004,10 @@ static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg arg,
             unsigned idx = type - riscv_lg2_vlenb;
 
             tcg_debug_assert(idx < ARRAY_SIZE(whole_reg_ld));
+            /* We must initialize vtype to something to avoid VILL. */
+            if (s->riscv_cur_type == TCG_TYPE_COUNT) {
+                set_vtype(s, type, MO_8);
+            }
             insn = whole_reg_ld[idx];
         } else {
             static const RISCVInsn unit_stride_ld[] = {
@@ -1039,6 +1040,7 @@ static void tcg_out_st(TCGContext *s, TCGType type, TCGReg arg,
     case TCG_TYPE_V64:
     case TCG_TYPE_V128:
     case TCG_TYPE_V256:
+        tcg_debug_assert(s->riscv_cur_type != TCG_TYPE_COUNT);
         if (type >= riscv_lg2_vlenb) {
             static const RISCVInsn whole_reg_st[] = {
                 OPC_VS1R_V, OPC_VS2R_V, OPC_VS4R_V, OPC_VS8R_V
@@ -2725,19 +2727,19 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         break;
     case INDEX_op_smax_vec:
         set_vtype_len_sew(s, type, vece);
-        tcg_out_opc_vv_vi(s, OPC_VMAX_VV, OPC_VMAX_VI, a0, a1, a2, c2);
+        tcg_out_opc_vv(s, OPC_VMAX_VV, a0, a1, a2);
         break;
     case INDEX_op_smin_vec:
         set_vtype_len_sew(s, type, vece);
-        tcg_out_opc_vv_vi(s, OPC_VMIN_VV, OPC_VMIN_VI, a0, a1, a2, c2);
+        tcg_out_opc_vv(s, OPC_VMIN_VV, a0, a1, a2);
         break;
     case INDEX_op_umax_vec:
         set_vtype_len_sew(s, type, vece);
-        tcg_out_opc_vv_vi(s, OPC_VMAXU_VV, OPC_VMAXU_VI, a0, a1, a2, c2);
+        tcg_out_opc_vv(s, OPC_VMAXU_VV, a0, a1, a2);
         break;
     case INDEX_op_umin_vec:
         set_vtype_len_sew(s, type, vece);
-        tcg_out_opc_vv_vi(s, OPC_VMINU_VV, OPC_VMINU_VI, a0, a1, a2, c2);
+        tcg_out_opc_vv(s, OPC_VMINU_VV, a0, a1, a2);
         break;
     case INDEX_op_shls_vec:
         set_vtype_len_sew(s, type, vece);
@@ -2889,10 +2891,6 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_sssub_vec:
     case INDEX_op_usadd_vec:
     case INDEX_op_ussub_vec:
-    case INDEX_op_smax_vec:
-    case INDEX_op_smin_vec:
-    case INDEX_op_umax_vec:
-    case INDEX_op_umin_vec:
         return C_O1_I2(v, v, vK);
     case INDEX_op_sub_vec:
         return C_O1_I2(v, vK, v);
@@ -2902,6 +2900,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
     case INDEX_op_sarv_vec:
     case INDEX_op_rotlv_vec:
     case INDEX_op_rotrv_vec:
+    case INDEX_op_smax_vec:
+    case INDEX_op_smin_vec:
+    case INDEX_op_umax_vec:
+    case INDEX_op_umin_vec:
         return C_O1_I2(v, v, v);
     case INDEX_op_shls_vec:
     case INDEX_op_shrs_vec:

@@ -3598,7 +3598,7 @@ static void gen_RDxxBASE(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_RET(DisasContext *s, X86DecodedInsn *decode)
 {
-    int16_t adjust = decode->e.op1 == X86_TYPE_I ? decode->immediate : 0;
+    uint16_t adjust = decode->e.op1 == X86_TYPE_I ? decode->immediate : 0;
 
     MemOp ot = gen_pop_T0(s);
     gen_stack_update(s, adjust + (1 << ot));
@@ -3609,7 +3609,7 @@ static void gen_RET(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_RETF(DisasContext *s, X86DecodedInsn *decode)
 {
-    int16_t adjust = decode->e.op1 == X86_TYPE_I ? decode->immediate : 0;
+    uint16_t adjust = decode->e.op1 == X86_TYPE_I ? decode->immediate : 0;
 
     if (!PE(s) || VM86(s)) {
         gen_lea_ss_ofs(s, s->A0, cpu_regs[R_ESP], 0);
@@ -3780,10 +3780,13 @@ static void gen_SAHF(DisasContext *s, X86DecodedInsn *decode)
         return gen_illegal_opcode(s);
     }
     tcg_gen_shri_tl(s->T0, cpu_regs[R_EAX], 8);
-    gen_neg_setcc(s, JCC_O << 1, cpu_cc_src);
-    tcg_gen_andi_tl(cpu_cc_src, cpu_cc_src, CC_O);
+    gen_neg_setcc(s, JCC_O << 1, s->T1);
+    tcg_gen_andi_tl(s->T1, s->T1, CC_O);
     tcg_gen_andi_tl(s->T0, s->T0, CC_S | CC_Z | CC_A | CC_P | CC_C);
-    tcg_gen_or_tl(cpu_cc_src, cpu_cc_src, s->T0);
+    tcg_gen_or_tl(s->T0, s->T0, s->T1);
+
+    decode->cc_src = s->T0;
+    decode->cc_op = CC_OP_EFLAGS;
 }
 
 static void gen_SALC(DisasContext *s, X86DecodedInsn *decode)
