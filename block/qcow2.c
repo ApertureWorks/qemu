@@ -2102,9 +2102,11 @@ qcow2_reopen_prepare(BDRVReopenState *state,BlockReopenQueue *queue,
             goto fail;
         }
 
-        ret = qcow2_mark_clean(state->bs);
-        if (ret < 0) {
-            goto fail;
+        if (bdrv_is_writable(state->bs)) {
+            ret = qcow2_mark_clean(state->bs);
+            if (ret < 0) {
+                goto fail;
+            }
         }
     }
 
@@ -2870,7 +2872,11 @@ static int GRAPH_RDLOCK qcow2_inactivate(BlockDriverState *bs)
                      strerror(-ret));
     }
 
-    if (result == 0) {
+    /*
+     * A read-only node cannot resolve an inherited dirty bit here;
+     * leave it dirty, same as plain read access already does.
+     */
+    if (result == 0 && !bdrv_is_read_only(bs)) {
         qcow2_mark_clean(bs);
     }
 
