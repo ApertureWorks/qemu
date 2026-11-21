@@ -35,6 +35,18 @@
 #include <virglrenderer.h>
 #include "virtio-gpu-fence-gate.h"
 
+/* Aperture (FP-14): per-event trace lines (blob creates, maps, context creates, scanout disables) only with
+ * APERTURE_GPU_TRACE=1 in the environment; errors are always printed. */
+static bool aperture_gpu_trace(void)
+{
+    static int on = -1; /* benign race: every thread computes the same value */
+    if (on < 0) {
+        const char *v = getenv("APERTURE_GPU_TRACE");
+        on = v && v[0] == '1';
+    }
+    return on;
+}
+
 /*
  * VIRGL_CHECK_VERSION available since libvirglrenderer 1.0.1 and was fixed
  * in 1.1.0. Undefine bugged version of the macro and provide our own.
@@ -246,11 +258,11 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
         data = surf_base;
         size = res->base.blob_size;
         ret = 0;
-        fprintf(stderr, "[VIRGL-MAP-IOSURFACE-DIRECT] ✅ res_id=%u mapped directly to IOSurface base=%p size=%llu\n",
+        if (aperture_gpu_trace()) fprintf(stderr, "[VIRGL-MAP-IOSURFACE-DIRECT] ✅ res_id=%u mapped directly to IOSurface base=%p size=%llu\n",
                 res->base.resource_id, data, (unsigned long long)size);
     } else {
         ret = virgl_renderer_resource_map(res->base.resource_id, &data, &size);
-        fprintf(stderr, "[VIRGL-MAP-BLOB-CALL] res_id=%u ret=%d data=%p size=%llu\n",
+        if (aperture_gpu_trace()) fprintf(stderr, "[VIRGL-MAP-BLOB-CALL] res_id=%u ret=%d data=%p size=%llu\n",
                 res->base.resource_id, ret, data, (unsigned long long)size);
         if (ret) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to map virgl resource: %s\n",
@@ -260,7 +272,7 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
     }
 #else
     ret = virgl_renderer_resource_map(res->base.resource_id, &data, &size);
-    fprintf(stderr, "[VIRGL-MAP-BLOB-CALL] res_id=%u ret=%d data=%p size=%llu\n",
+    if (aperture_gpu_trace()) fprintf(stderr, "[VIRGL-MAP-BLOB-CALL] res_id=%u ret=%d data=%p size=%llu\n",
             res->base.resource_id, ret, data, (unsigned long long)size);
     if (ret) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to map virgl resource: %s\n",
@@ -281,7 +293,7 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
         hv_vm_unmap(gpa, map_size);
         hv_return_t hv_ret = hv_vm_map(data, gpa, map_size,
                                        HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
-        fprintf(stderr, "[VIRGL-HVF-DIRECT-MAP] res_id=%u gpa=0x%llx size=0x%llx host=%p ret=%d\n",
+        if (aperture_gpu_trace()) fprintf(stderr, "[VIRGL-HVF-DIRECT-MAP] res_id=%u gpa=0x%llx size=0x%llx host=%p ret=%d\n",
                 res->base.resource_id, (unsigned long long)gpa, (unsigned long long)map_size, data, hv_ret);
         if (hv_ret != HV_SUCCESS) {
             return -EINVAL;
@@ -596,7 +608,7 @@ static void virgl_cmd_context_create(VirtIOGPU *g,
     struct virtio_gpu_ctx_create cc;
 
     VIRTIO_GPU_FILL_CMD(cc);
-    fprintf(stderr, "[VIRGL-CTX-CREATE] ctx_id=%u context_init=0x%x nlen=%u name=%s\n",
+    if (aperture_gpu_trace()) fprintf(stderr, "[VIRGL-CTX-CREATE] ctx_id=%u context_init=0x%x nlen=%u name=%s\n",
             cc.hdr.ctx_id, cc.context_init, cc.nlen, cc.debug_name);
 
     if (cc.context_init) {
@@ -836,7 +848,7 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
                 d3d_tex2d);
         }
     } else {
-        fprintf(stderr, "[VIRGL-SET-SCANOUT-DISABLED] scanout_id=%u\n", ss.scanout_id);
+        if (aperture_gpu_trace()) fprintf(stderr, "[VIRGL-SET-SCANOUT-DISABLED] scanout_id=%u\n", ss.scanout_id);
         qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
         qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
     }
@@ -1106,7 +1118,7 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
 
     VIRTIO_GPU_FILL_CMD(cblob);
     virtio_gpu_create_blob_bswap(&cblob);
-    fprintf(stderr, "[QEMU-BLOB-CREATE] res=%u blob_mem=0x%x blob_flags=0x%x size=%" PRIu64 " blob_id=0x%" PRIx64 "\n",
+    if (aperture_gpu_trace()) fprintf(stderr, "[QEMU-BLOB-CREATE] res=%u blob_mem=0x%x blob_flags=0x%x size=%" PRIu64 " blob_id=0x%" PRIx64 "\n",
             cblob.resource_id, cblob.blob_mem, cblob.blob_flags, (uint64_t)cblob.size, (uint64_t)cblob.blob_id);
     trace_virtio_gpu_cmd_res_create_blob(cblob.resource_id, cblob.size);
 
